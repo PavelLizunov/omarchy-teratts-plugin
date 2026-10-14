@@ -37,6 +37,8 @@ jobs:
       - name: Public package contract
         run: |
           python3 -B tools/check-publication.py
-          bash -n bin/speak lib/config.sh providers/teratts ocr/remote
+          for script in bin/speak lib/*.sh providers/teratts ocr/*; do
+            bash -n "$script"
+          done
           jq -e '.id == "io.github.pavellizunov.teratts" and .entryPoints.barWidget == "BarWidget.qml"' manifest.json
           test -x bin/speak && test -x providers/teratts
