@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# desc: Self-hosted TeraTTSv2 server with ruaccent and speechfront
+# title: TeraTTS
+# kind: cloud
+# probe: endpoint="${TERATTS_URL:-$(jq -r '.teratts.endpoint // empty' "$TTS_CONFIG" 2>/dev/null)}"; [[ -n "$endpoint" && "$endpoint" != "null" ]] && curl -fsS -m 2 --max-filesize 65536 "${endpoint%/}/health" | jq -e '.status == "ready"' >/dev/null
+# vendor: TeraTTS
+# keyname: teratts
+# keyenv: TERATTS_BEARER_TOKEN
+# voices: remote
+# refreshvoices: true
+# maxchars: 100000
+# ratemin: 0.25
+# ratemax: 4.0
+# preprocess: raw
+set -uo pipefail
+umask 077
+source "$TTS_PLUGIN_DIR/lib/keys.sh"
+
+if [[ "${TTS_JOB_KIND:-}" == preview ]]; then
+  exec python3 "$TTS_PLUGIN_DIR/lib/audio_job.py"
+fi
+
+ENDPOINT="${TERATTS_URL:-}"
+[[ -z "$ENDPOINT" ]] && ENDPOINT="$(jq -r '.teratts.endpoint // empty' "$TTS_CONFIG" 2>/dev/null)"
+if [[ -z "$ENDPOINT" || "$ENDPOINT" == "null" ]]; then
+  printf 'teratts: configure your server address in Settings > Server first\n' >&2
+  exit 65
+fi
+ENDPOINT="${ENDPOINT%/}"
+if [[ ! "$ENDPOINT" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$ENDPOINT" =~ ^http://(127[.]0[.]0[.]1|localhost|\[::1\])(:[0-9]{1,5})?$ ]]; then
+  printf 'teratts: invalid endpoint\n' >&2
+  exit 65
+fi
+
+if [[ "${1:-}" == "--voices" ]]; then
+  # Cap before shell accumulation; the reader also bounds curl versions without streaming max-filesize.
+  health_json="$(curl -fsS -m 3 --max-filesize 2097152 "$ENDPOINT/health" 2>/dev/null |
+    python3 -c 'import sys
+data = sys.stdin.buffer.read(2097153)
+if len(data) > 2097152:
+    sys.exit(1)
+sys.stdout.buffer.write(data)')" || health_json=""
+  if jq -e '.voices | type == "array" and length > 0' <<< "$health_json" >/dev/null 2>&1; then
+    jq -c '[.voices[] | {
+      value: .,
+      label: (
+        if . == "ru_f1" then "Russian Female 1"
+        elif . == "ru_f2" then "Russian Female 2"
+        elif . == "ru_m1" then "Russian Male 1"
+        elif . == "ru_m5" then "Russian Male 5"
+        elif . == "eng_f3" then "English Female 3"
+        elif . == "eng_f4_whisper" then "English Female 4 (Whisper)"
+        elif . == "eng_f5" then "English Female 5"
+        elif . == "eng_m2_whisper" then "English Male 2 (Whisper)"
+        elif . == "eng_m3" then "English Male 3"
+        elif . == "eng_m4" then "English Male 4"
+        else . end
+      ),
+      language: (if startswith("eng_") then "en" else "ru" end)
+    }]' <<< "$health_json"
+    exit 0
+  fi
+  jq -nc '[
+    {"value":"ru_f1","label":"Russian Female 1","language":"ru"},
+    {"value":"ru_f2","label":"Russian Female 2","language":"ru"},
+    {"value":"ru_m1","label":"Russian Male 1","language":"ru"},
+    {"value":"ru_m5","label":"Russian Male 5","language":"ru"},
+    {"value":"eng_f3","label":"English Female 3","language":"en"},
+    {"value":"eng_f4_whisper","label":"English Female 4 (Whisper)","language":"en"},
+    {"value":"eng_f5","label":"English Female 5","language":"en"},
+    {"value":"eng_m2_whisper","label":"English Male 2 (Whisper)","language":"en"},
+    {"value":"eng_m3","label":"English Male 3","language":"en"},
+    {"value":"eng_m4","label":"English Male 4","language":"en"}
+  ]'
+  exit 0
+fi
+
+KEY="$(get_key TERATTS_BEARER_TOKEN teratts)" || exit 1
+
+VOICE="${TTS_VOICE:-}"
+[[ -z "$VOICE" ]] && VOICE="$(jq -r '.teratts.voice // "ru_f1"' "$TTS_CONFIG" 2>/dev/null)"
+[[ -z "$VOICE" || "$VOICE" == "null" ]] && VOICE="ru_f1"
+
+TEXT_MODE="$(jq -r '.teratts.text_mode // "russian_only"' "$TTS_CONFIG" 2>/dev/null)"
+[[ -z "$TEXT_MODE" || "$TEXT_MODE" == "null" ]] && TEXT_MODE="russian_only"
+
+SPEECH_FRONT="$(jq -r '.teratts.speech_front // true' "$TTS_CONFIG" 2>/dev/null)"
+[[ "$SPEECH_FRONT" != "false" ]] && SPEECH_FRONT="true"
+
+TERATTS_ENDPOINT="$ENDPOINT" \
+TERATTS_TOKEN="$KEY" \
+TERATTS_VOICE="$VOICE" \
+TERATTS_RATE="${TTS_RATE:-1.0}" \
+TERATTS_TEXT_MODE="$TEXT_MODE" \
+TERATTS_SPEECH_FRONT="$SPEECH_FRONT" \
+exec python3 "$TTS_PLUGIN_DIR/lib/audio_job.py"

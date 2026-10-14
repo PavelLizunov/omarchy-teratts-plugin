@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.pavellizunov.teratts",
+  "name": "TeraTTS",
+  "version": "0.3.17",
+  "author": "PavelLizunov",
+  "license": "MIT",
+  "description": "Read selected text through a personal TeraTTS server",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "TeraTTS",
+    "description": "Read selected text through a personal TeraTTS server",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "locale": "ru"
+    },
+    "schema": [
+      {
+        "key": "locale",
+        "type": "string",
+        "label": "Interface language (ru, en, system)",
+        "defaultValue": "ru"
+      }
+    ]
+  }
+}

@@ -1,0 +1,118 @@
+{
+  "date": "2026-10-14",
+  "origin": "Actual package QML with inert I/O and installed native controls",
+  "qt": "6.12.0",
+  "backend": "software/offscreen",
+  "sourceHashes": {
+    "Panel.qml": "d8c3140801f43e515110355094471ab7c4549e74bebdba465d4dab06e2a321d5",
+    "BarWidget.qml": "772e0f453a91f0ed597a0e91d46f2652b03100434308b65f63926a045b37419e",
+    "TeraIcon.qml": "cc696cb2656a0b5bccff130bf94887b39b59b0bd669a35aba34bf3820c6ef94b",
+    "I18n.qml": "ed2e11bfc16ceda261cb358f749aedc80a98333bcff432f4041956b114039136",
+    "StateStream.qml": "60ff236f700913d5cd97bdbdc7361933ed8b15e9e71f4513f10657a8e529c32e",
+    "tests/capture_ui.py": "9056837aa2772a933a12e6ef44e4e5561f36375cb123d1d69adc6f45c6c91318",
+    "tests/capture_demo.py": "e820e8df7bbf801c491b803fe420663c0acf2ffd7c0cb103840b3050fad43ca8",
+    "tests/ui/tst_panel.qml": "d82ec7eb113f5db61837840f82109b50998a76d4492b25c2636e1a35ccfef471",
+    "tests/ui/preview.qml": "a71bcb3828e442fa22ff27b1fe2cdba7aa5cff4d94590c0fed6cc686c6920917",
+    "locales/en.json": "7cdcaf03f191021efd7a2d80abb393061d08bbb4f43ebb35ecc230c86af9f365",
+    "locales/ru.json": "d08c6456ff17c020fe334448331650ba012232bb50139cfef9aa6e58256b3490"
+  },
+  "media": {
+    "read-dark.png": {
+      "sha256": "b74ec0ebb5c15742e7b1a1dddb3e087f39dcf64263584c2a6e7b8b5da4ac23a6",
+      "logical": [
+        380,
+        540
+      ],
+      "pixels": [
+        760,
+        1080
+      ],
+      "dpr": 2,
+      "locale": "en_US",
+      "inert": true,
+      "inspected": true,
+      "rendererSha256": "779c33b56b756bcf1cd8a02740574b31b5362c81a31d53b98485133a72079cac"
+    },
+    "read-light.png": {
+      "sha256": "974101545f265eae341bb1fe063f83272a398451295d55ee9f9ad0a52eb942f8",
+      "logical": [
+        380,
+        540
+      ],
+      "pixels": [
+        760,
+        1080
+      ],
+      "dpr": 2,
+      "locale": "en_US",
+      "inert": true,
+      "inspected": true,
+      "rendererSha256": "779c33b56b756bcf1cd8a02740574b31b5362c81a31d53b98485133a72079cac"
+    },
+    "files-dark.png": {
+      "sha256": "c3647b74da9c797484c6dc6134994c4c7de99c24f89a5ae552fb7d0632db92d0",
+      "logical": [
+        380,
+        540
+      ],
+      "pixels": [
+        760,
+        1080
+      ],
+      "dpr": 2,
+      "locale": "en_US",
+      "inert": true,
+      "inspected": true,
+      "rendererSha256": "779c33b56b756bcf1cd8a02740574b31b5362c81a31d53b98485133a72079cac"
+    },
+    "settings-dark.png": {
+      "sha256": "cc13d9d819a35a6fc85f116a5e3d65aed462c5c91297f6bbdb903abbad6016f0",
+      "logical": [
+        380,
+        540
+      ],
+      "pixels": [
+        760,
+        1080
+      ],
+      "dpr": 2,
+      "locale": "en_US",
+      "inert": true,
+      "inspected": true,
+      "rendererSha256": "779c33b56b756bcf1cd8a02740574b31b5362c81a31d53b98485133a72079cac"
+    },
+    "demo.mp4": {
+      "sha256": "02550152f815c20e28f56deff82d6303bfaa4f30bd5946106ab7fcad3ef96560",
+      "frames": 54,
+      "seconds": 18,
+      "fps": 3,
+      "pixels": [
+        380,
+        540
+      ],
+      "audio": false,
+      "actualQtNavigation": true,
+      "fixturePlayback": true,
+      "inspectedContactFrames": 6,
+      "minSsim": 0.9963,
+      "meanSsim": 0.9969,
+      "framesBelow098": 0
+    }
+  },
+  "host": {
+    "omarchy": "4.0.4",
+    "qt": "6.12.0",
+    "rendererVersion": "0.3.0",
+    "rendererSha256": "779c33b56b756bcf1cd8a02740574b31b5362c81a31d53b98485133a72079cac",
+    "rawInstalledControls": {
+      "Commons/Color.qml": "cc9b62e2eaf8c307aa02206d9320c3d0ca349cf8feed452a6eddf387adaa5320",
+      "Commons/Style.qml": "f5901092617ae62645597199270afd4dfb0644d596bdfff16e1834fca6ad7243",
+      "Ui/Button.qml": "fda48672cc11dba109acea1cc98eb4b29746e5ce09f90a47f487b776ff99e799",
+      "Ui/Dropdown.qml": "6e2b847a33f5dedb96f65757d284f40b90073b3b34fd31abb84b2d471814fc5c",
+      "Ui/KeyboardPanel.qml": "96245f2da8d38baa0017caa285d596c485bd19a3a4d2cd1675bee9d84ffba42d",
+      "Ui/PanelSectionHeader.qml": "ede63ff97dd3d4d2198b771cbb33dcd07b7026d64d92f1c624e71465d000115d",
+      "Ui/TextField.qml": "b3ad72f56f86c2df164e347d64205c099f77c5fb90933fabea3b0f2a9e2b3778",
+      "Ui/PanelSlider.qml": "aa8fcf167324ff9eb60a219f037004482adbe2a30369af123d53956a81a93068"
+    }
+  }
+}

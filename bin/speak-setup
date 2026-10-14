@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+"""Graphical-frontend backend for first-run setup and repair.
+
+All public commands emit one JSON object. Long operations run as detached jobs
+whose progress is read by the settings panel. Installation targets are a fixed
+allowlist; no command supplied by QML or provider metadata is executed.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import zipfile
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+os.umask(0o077)
+
+PLUGIN = Path(__file__).resolve().parents[1]
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+# Without a session runtime dir, fall back to an owner-only XDG state
+# directory rather than sticky /tmp.
+RUNTIME = (Path(os.environ["XDG_RUNTIME_DIR"]) / "omarchy-tts"
+           if os.environ.get("XDG_RUNTIME_DIR")
+           else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+           / "omarchy-tts" / "run")
+DATA = DATA_HOME / "omarchy-tts"
+ENGINE = DATA / "engines"
+STATE = RUNTIME / "setup.json"
+SETUP_LOCK = RUNTIME / "setup.lock"
+HEALTH = CACHE_HOME / "omarchy-tts" / "health.json"
+VOICE_CACHE = CACHE_HOME / "omarchy-tts" / "voices"
+BINDINGS_TOOL = PLUGIN / "bin" / "speak-bindings"
+DEFAULT_VOICE = "ru_f1"
+# Every managed engine installs from a complete, hash-pinned dependency
+# closure shipped with the plugin (lib/engines/<engine>.lock, produced by
+# `tools/pin-engines lock`) and applied with `uv pip sync --require-hashes`,
+# so a later resolver result or index change cannot add code this commit did
+# not review. Model artefacts come from lib/engines/models.json: immutable
+# sources with SHA-256 digests, verified at install and again before load.
+ENGINE_SPECS = PLUGIN / "lib" / "engines"
+# A dependency that publishes no wheel would force a source build, whose
+# build backend uv resolves unhashed from the index. Such packages are
+# instead shipped as reviewed wheels under lib/engines/wheels, built
+# reproducibly from the hash-verified sdist (see DEVELOPMENT.md).
+ENGINE_LOCKS = {name: ENGINE_SPECS / f"{name}.lock" for name in ("easyocr",)}
+MODEL_MANIFEST = ENGINE_SPECS / "models.json"
+LOCK_STAMP = ".lock-sha256"
+ENGINE_PYTHON = "3.12"
+# The privilege boundary takes fixed canonical paths, never a PATH lookup:
+# a user-writable executable earlier in PATH must not be what pkexec runs
+# as root. Both are re-verified immediately before every privileged call.
+PKEXEC = Path("/usr/bin/pkexec")
+PACMAN = Path("/usr/bin/pacman")
+SYSTEM_UV = Path("/usr/bin/uv")
+ARTEFACT_MAX_BYTES = 1_073_741_824
+JOB_PID = 0
+JOB_IDENTITY = ""
+JOB_TARGET = ""
+HELPER_TIMEOUT = 30
+INSTALL_TIMEOUT = 1800
+CONTROL_JSON_MAX_BYTES = 65_536
+HEALTH_MAX_BYTES = 1_048_576
+SETUP_LOCK_FD_ENV = "OMARCHY_TTS_SETUP_LOCK_FD"
+
+
+class SetupCancelled(Exception):
+    """Raised from the worker's signal handler so transactions can roll back."""
+
+
+def cancel_worker_signal(_signum, _frame) -> None:
+    raise SetupCancelled
+
+
+def ensure_private_runtime() -> None:
+    if RUNTIME.is_symlink():
+        raise RuntimeError(f"Unsafe runtime directory symlink: {RUNTIME}")
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    if RUNTIME.is_symlink() or RUNTIME.stat().st_uid != os.getuid():
+        raise RuntimeError(f"Unsafe runtime directory: {RUNTIME}")
+    RUNTIME.chmod(0o700)
+
+
+def open_private_lock(path: Path) -> int:
+    """Open an owner-only regular lock file without following a symlink."""
+    flags = os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Unsafe lock file: {path}")
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def claim_inherited_setup_lock() -> int:
+    """Verify and retain the lock descriptor supplied by start()."""
+    raw_descriptor = os.environ.pop(SETUP_LOCK_FD_ENV, "")
+    if not re.fullmatch(r"[0-9]+", raw_descriptor):
+        raise RuntimeError("Setup worker has no inherited lock")
+    descriptor = int(raw_descriptor)
+    if descriptor <= 2:
+        raise RuntimeError("Setup worker received an invalid lock")
+    try:
+        inherited = os.fstat(descriptor)
+        expected = SETUP_LOCK.stat()
+    except OSError as exc:
+        raise RuntimeError("Setup worker lock is unavailable") from exc
+    if (not stat.S_ISREG(inherited.st_mode)
+            or inherited.st_uid != os.getuid()
+            or (inherited.st_dev, inherited.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise RuntimeError("Setup worker received the wrong lock")
+    try:
+        # The inherited open-file description already owns this lock. Calling
+        # flock again both verifies that fact and safely acquires it for a
+        # direct, correctly supervised invocation.
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError("Another setup worker owns the lock") from exc
+    return descriptor
+
+
+def emit(**values) -> None:
+    print(json.dumps(values, ensure_ascii=False), flush=True)
+
+
+def replace_json(path: Path, value: dict) -> None:
+    """Durably replace a small private JSON control file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_small_json(path: Path, maximum: int = CONTROL_JSON_MAX_BYTES):
+    """Parse a bounded, owner-controlled regular file without following links."""
+    flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_size > maximum):
+            raise ValueError(f"Unsafe or oversized JSON control file: {path}")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            return json.loads(stream.read(maximum + 1))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    ensure_private_runtime()
+    replace_json(path, value)
+
+
+def write_state(status: str, step: str = "", progress: int = 0,
+                message: str = "", **extra) -> None:
+    if JOB_PID:
+        extra.setdefault("pid", JOB_PID)
+        extra.setdefault("processIdentity", JOB_IDENTITY)
+        extra.setdefault("target", JOB_TARGET)
+        extra.setdefault("cancellable", True)
+    current = {"status": status, "step": step, "progress": progress,
+               "message": message, **extra}
+    atomic_json(STATE, current)
+
+
+def process_identity(pid: int) -> str:
+    try:
+        # The command name in /proc/<pid>/stat is parenthesized and may itself
+        # contain spaces. Split after its final ')' so field 22 (start time)
+        # cannot shift underneath us.
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return ""
+
+
+def process_group(pid: int) -> int:
+    try:
+        return os.getpgid(pid) if pid > 1 else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def engine_built_from_lock(name: str) -> bool:
+    """True only for an engine directory whose recorded lock digest equals
+    the lock this plugin ships; anything else is not this release's engine."""
+    stamp = ENGINE / name / LOCK_STAMP
+    lock = ENGINE_LOCKS.get(name)
+    try:
+        if stamp.is_symlink() or lock is None or lock.is_symlink():
+            return False
+        recorded = stamp.read_text().strip()
+        return bool(re.fullmatch(r"[0-9a-f]{64}", recorded)) and recorded == sha256_file(lock)
+    except OSError:
+        return False
+
+
+def status() -> dict:
+    engine_ready = False
+    voice_ready = False
+    voice = DEFAULT_VOICE
+    try:
+        result = subprocess.run([str(PLUGIN / "bin/speak"), "--info"],
+                                capture_output=True, timeout=5)
+        if result.returncode == 0 and len(result.stdout) <= CONTROL_JSON_MAX_BYTES:
+            info = json.loads(result.stdout)
+            voice = info.get("voice", DEFAULT_VOICE)
+            engine_ready = any(p.get("name") == "teratts" and
+                               p.get("status") in ("ready", "untested")
+                               for p in info.get("providers", []))
+            # --info validates the selected built-in voice even before the
+            # optional voice-list cache has been refreshed. No network proof.
+            voice_ready = isinstance(voice, str) and bool(re.fullmatch(
+                r"ru_(?:f1|f2|m1|m5)|eng_(?:f3|f4_whisper|f5|m2_whisper|m3|m4)", voice))
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        pass
+    bindings = False
+    try:
+        result = subprocess.run([BINDINGS_TOOL, "status"], text=True,
+                                capture_output=True, timeout=3)
+        bindings = result.returncode == 0 and json.loads(result.stdout).get("installed", False)
+    except (OSError, ValueError, TypeError, AttributeError,
+            subprocess.TimeoutExpired):
+        pass
+    return {
+        "ok": True,
+        "ready": engine_ready and voice_ready,
+        "engineReady": engine_ready,
+        "voiceReady": voice_ready,
+        "bindingsReady": bindings,
+        "defaultVoice": voice,
+        "readiness": "configured" if engine_ready and voice_ready else "not_configured",
+        "dataPath": str(DATA),
+    }
+
+
+def run_checked(argv: list[str], *, env: dict | None = None,
+                timeout: int = INSTALL_TIMEOUT, cwd: Path | None = None) -> None:
+    """Run an installer without retaining an unbounded log in memory."""
+    with tempfile.TemporaryFile() as log:
+        try:
+            result = subprocess.run(argv, env=env, stdout=log, cwd=cwd,
+                                    stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{argv[0]} did not finish within {timeout} seconds") from exc
+        if result.returncode:
+            length = log.tell()
+            log.seek(max(0, length - 8192))
+            message = log.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError((message or f"{argv[0]} failed")[-800:])
+
+
+def trusted_system_executable(path: Path) -> str:
+    """Admit an executable across the privilege boundary only if it is what
+    the distribution installed: an absolute canonical path with no symlink
+    component, owned by root, and not writable by group or others at any
+    level up to the filesystem root."""
+    if not path.is_absolute() or path != Path(os.path.normpath(path)):
+        raise RuntimeError(f"Refusing non-canonical executable path {path}")
+    for node in (path, *path.parents):
+        try:
+            info = os.lstat(node)
+        except OSError as exc:
+            raise RuntimeError(f"{path} is unavailable: {node} cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RuntimeError(f"Refusing {path}: {node} is a symbolic link")
+        if info.st_uid != 0:
+            raise RuntimeError(f"Refusing {path}: {node} is not owned by root")
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(f"Refusing {path}: {node} is writable by other users")
+    if not stat.S_ISREG(os.lstat(path).st_mode) or not os.access(path, os.X_OK):
+        raise RuntimeError(f"{path} is not an executable file")
+    return str(path)
+
+
+def privileged_pacman(*packages: str) -> None:
+    """Run the package manager as root through the fixed privilege helper.
+
+    The helper and the package manager are checked at the moment of use, not
+    at import or earlier in the job, so nothing can be swapped in between.
+    """
+    argv = [trusted_system_executable(PKEXEC), trusted_system_executable(PACMAN),
+            "-S", "--noconfirm", "--needed", *packages]
+    run_checked(argv)
+
+
+def ensure_uv() -> str:
+    """Only the distribution's uv builds engines. A uv found on PATH would be
+    a user-writable binary deciding what the hash-locked install does, so it
+    is not consulted; if the system has none, it is installed through the
+    same privileged path as every other package."""
+    try:
+        return trusted_system_executable(SYSTEM_UV)
+    except RuntimeError:
+        pass
+    try:
+        trusted_system_executable(PKEXEC)
+        trusted_system_executable(PACMAN)
+    except RuntimeError as exc:
+        raise RuntimeError(f"The uv installer is unavailable: {exc}") from exc
+    write_state("running", "permission", 5,
+                "Administrator approval is required to install uv",
+                cancellable=False)
+    privileged_pacman("uv")
+    try:
+        return trusted_system_executable(SYSTEM_UV)
+    except RuntimeError as exc:
+        raise RuntimeError("uv was installed but could not be found") from exc
+
+
+def uv_environment() -> dict:
+    """uv reads index, find-links and python-source overrides from UV_* and
+    PIP_* variables and from ~/.config/uv/uv.toml. None of those may steer a
+    locked install, so they are dropped (the cache location is kept)."""
+    keep = {"UV_CACHE_DIR"}
+    return {k: v for k, v in os.environ.items()
+            if not ((k.startswith("UV_") and k not in keep) or k.startswith("PIP_"))}
+
+
+def sync_locked(uv: str, python: str, engine: str) -> None:
+    """Install exactly the reviewed closure: every requirement pinned and
+    hash-checked, wheels only so no build backend is ever resolved, nothing
+    beyond the lock. lib/engines/wheels is a flat index of the plugin's own
+    reviewed wheels for the few dependencies that publish none; a lock hash
+    admits only those exact files."""
+    lock = ENGINE_LOCKS[engine]
+    if lock.is_symlink() or not lock.is_file():
+        raise RuntimeError(f"The {engine} dependency lock is missing from the plugin")
+    verify_reviewed_wheels()
+    run_checked([uv, "--no-config", "pip", "sync", "--python", python, "--require-hashes",
+                 "--only-binary", ":all:", "--find-links", str(ENGINE_SPECS / "wheels"),
+                 str(lock)], env=uv_environment())
+    # Record which reviewed lock built this environment. Probes and providers
+    # require it to match the shipped lock, so an environment built by an
+    # earlier release - or by anything else - is not treated as installed.
+    (Path(python).parent.parent / LOCK_STAMP).write_text(sha256_file(lock) + "\n")
+
+
+def verify_reviewed_wheels() -> None:
+    """The flat index may hold only the wheels this commit reviewed. uv checks
+    the lock hash of whatever it picks; this checks the directory itself, so a
+    stray or altered file fails the install before uv is even asked."""
+    wheels = ENGINE_SPECS / "wheels"
+    sums = wheels / "SHA256SUMS"
+    if sums.is_symlink() or not sums.is_file():
+        raise RuntimeError("The reviewed wheel index has no digest list")
+    expected = {}
+    for line in sums.read_text().splitlines():
+        digest, _, name = line.partition("  ")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not re.fullmatch(r"[A-Za-z0-9._-]+\.whl", name):
+            raise RuntimeError("The reviewed wheel digest list is malformed")
+        expected[name] = digest
+    present = {entry.name for entry in wheels.iterdir() if entry.name != "SHA256SUMS"}
+    if present != set(expected):
+        raise RuntimeError("The reviewed wheel index does not match its digest list")
+    for name, digest in expected.items():
+        path = wheels / name
+        if path.is_symlink() or not path.is_file() or sha256_file(path) != digest:
+            raise RuntimeError(f"Reviewed wheel {name} failed verification")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_manifest() -> dict:
+    if MODEL_MANIFEST.is_symlink() or not MODEL_MANIFEST.is_file():
+        raise RuntimeError("The model manifest is missing from the plugin")
+    data = json.loads(MODEL_MANIFEST.read_text())
+    if not isinstance(data, dict):
+        raise RuntimeError("The model manifest is malformed")
+    return data
+
+
+def fetch_verified(url: str, dest: Path, sha256: str, size: int) -> None:
+    """Download one artefact over HTTPS only and keep it only if it hashes to
+    the digest this commit ships. Anything else is deleted."""
+    if not url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise RuntimeError(f"Refusing artefact with an unpinned source or digest: {dest.name}")
+    if not isinstance(size, int) or size <= 0 or size > ARTEFACT_MAX_BYTES:
+        raise RuntimeError(f"Refusing artefact with an implausible size: {dest.name}")
+    part = dest.with_name(dest.name + ".part")
+    part.unlink(missing_ok=True)
+    try:
+        run_checked(["curl", "-sSf", "--proto", "=https", "--proto-redir", "=https",
+                     "--connect-timeout", "15", "--max-time", "1800",
+                     "--max-filesize", str(size), "-L", url, "-o", str(part)])
+        if part.stat().st_size != size:
+            raise RuntimeError(f"{dest.name}: downloaded size does not match the manifest")
+        if sha256_file(part) != sha256:
+            raise RuntimeError(f"{dest.name}: downloaded artefact does not match its shipped digest")
+        part.replace(dest)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def install_easyocr_models(models: Path) -> None:
+    """Fetch each recognition model as a whole verified archive and extract
+    only the named member, verified again; the library's own downloader is
+    never enabled."""
+    manifest = model_manifest().get("easyocr", {}).get("models", {})
+    if not manifest:
+        raise RuntimeError("The model manifest has no EasyOCR entries")
+    models.mkdir(parents=True, exist_ok=True)
+    for name, entry in manifest.items():
+        if not re.fullmatch(r"[A-Za-z0-9_]+\.pth", name):
+            raise RuntimeError(f"Refusing model with an unexpected name: {name}")
+        archive = models / f".{name}.zip"
+        staged = models / f".{name}.part"
+        fetch_verified(entry["url"], archive, entry["archive_sha256"], entry["archive_size"])
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                member = bundle.getinfo(name)   # exact member name only, never a path
+                if member.file_size != entry["size"]:
+                    raise RuntimeError(f"{name}: archive member size does not match the manifest")
+                with bundle.open(member) as source, open(staged, "wb") as sink:
+                    shutil.copyfileobj(source, sink, 1 << 20)
+        except (KeyError, zipfile.BadZipFile) as exc:
+            raise RuntimeError(f"{name}: archive does not contain the expected model") from exc
+        finally:
+            archive.unlink(missing_ok=True)
+        if sha256_file(staged) != entry["sha256"]:
+            staged.unlink(missing_ok=True)
+            raise RuntimeError(f"{name}: extracted model does not match its shipped digest")
+        staged.replace(models / name)
+
+
+def create_venv(uv: str, target: Path, python_version: str | None = None) -> None:
+    """Create a fresh managed environment at a private staging path."""
+    if target.exists() or target.is_symlink():
+        raise RuntimeError(f"Unsafe existing staging path: {target}")
+    # The environment is built at a private staging path and renamed into
+    # place on success. Console scripts carry an absolute shebang unless the
+    # venv is relocatable, and a shebang naming the staging path fails with
+    # exit 126 the moment the rename lands.
+    argv = [uv, "--no-config", "venv", "--relocatable"]
+    if python_version is not None:
+        argv.extend(["--python", python_version])
+    argv.append(str(target))
+    run_checked(argv, env=uv_environment())
+
+
+LANGUAGE_PREFIX = "lang:"
+LANGUAGE_CODE = re.compile(r"^[a-z]{3,4}(_[a-z]+)?$")
+
+
+def language_package(code: str) -> str:
+    if not LANGUAGE_CODE.fullmatch(code):
+        raise RuntimeError("Unsupported language code")
+    package = f"tesseract-data-{code}"
+    try:
+        pacman = trusted_system_executable(PACMAN)
+    except RuntimeError as exc:
+        raise RuntimeError("Package management is unavailable") from exc
+    try:
+        known = subprocess.run([pacman, "-Si", package], capture_output=True,
+                               text=True, timeout=HELPER_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Package availability could not be checked") from exc
+    if known.returncode:
+        raise RuntimeError(f"No language package named {package}")
+    return package
+
+
+def install_language(code: str) -> None:
+    package = language_package(code)
+    try:
+        trusted_system_executable(PKEXEC)
+    except RuntimeError as exc:
+        raise RuntimeError("Graphical package installation is unavailable") from exc
+    write_state("running", "permission", 10, "Waiting for administrator approval",
+                cancellable=False)
+    privileged_pacman(package)
+    write_state("running", "verify", 85, "Checking the language is available")
+    speak = Path(__file__).resolve().parent / "speak"
+    if speak.exists():
+        result = subprocess.run([str(speak), "--refresh-languages", "tesseract"],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or
+                               "The language installed, but recognition could not refresh it")
+
+
+OCR_ENGINES = {"easyocr"}
+# Every cloud key the plugin will store. Google and OpenAI credentials are
+# shared by their speech and OCR adapters.
+CLOUD_KEYS = ("openai", "elevenlabs", "google", "gemini", "teratts")
+
+
+def build_easyocr(target: Path) -> None:
+    uv = ensure_uv()
+    write_state("running", "engine", 20, "Installing the EasyOCR engine (this is large)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    create_venv(uv, target, ENGINE_PYTHON)
+    sync_locked(uv, str(target / "bin/python"), "easyocr")
+    # The engine never downloads at read time, and neither does the installer
+    # through the library: each model comes from a pinned release archive and
+    # is digest-verified before it is placed where EasyOCR will load it.
+    write_state("running", "engine", 70, "Downloading and verifying the English recognition models")
+    install_easyocr_models(target / "models")
+
+
+def prove(target: str) -> None:
+    """Verify freshly installed OCR with the plugin's known image."""
+    if target.startswith(LANGUAGE_PREFIX):
+        return
+    if target not in OCR_ENGINES:
+        raise RuntimeError("Unsupported OCR installation target")
+    speak = PLUGIN / "bin/speak"
+    write_state("running", "verify", 90, "Checking OCR")
+    try:
+        subprocess.run([str(speak), "--verify-ocr", target], timeout=300,
+                       capture_output=True, text=True, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"{target} installed but OCR verification failed") from exc
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def recover_engine_transaction(name: str) -> None:
+    """Roll back an interrupted activation and discard abandoned staging."""
+    target = ENGINE / name
+    journal = ENGINE / f".{name}.transaction.json"
+    if target.is_symlink():
+        raise RuntimeError(f"Refusing to replace symlinked engine: {target}")
+    if target.exists() and not target.is_dir():
+        raise RuntimeError(f"Refusing to replace non-directory engine: {target}")
+
+    if journal.is_symlink():
+        raise RuntimeError(f"Refusing unsafe engine recovery journal: {journal}")
+    if journal.exists():
+        try:
+            record = read_small_json(journal)
+            if not isinstance(record, dict):
+                raise ValueError("transaction journal is not an object")
+            staging = Path(record["staging"])
+            backup = Path(record["backup"])
+            had_previous = record["hadPrevious"]
+            phase = record.get("phase", "activating")
+            if (staging.parent != ENGINE or backup.parent != ENGINE
+                    or not staging.name.startswith(f".{name}.staging.")
+                    or not backup.name.startswith(f"{name}.previous.")
+                    or not isinstance(had_previous, bool)
+                    or phase not in {"activating", "proved"}
+                    or staging.is_symlink() or backup.is_symlink()
+                    or (staging.exists() and not staging.is_dir())
+                    or (backup.exists() and not backup.is_dir())):
+                raise ValueError("unsafe transaction paths")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Engine recovery journal is unreadable: {journal}"
+            ) from exc
+
+        if phase == "proved" and target.is_dir() and not staging.exists():
+            # Proof completed and the phase marker reached durable storage.
+            # Finish the commit if power failed before backup/journal cleanup.
+            remove_path(backup)
+        else:
+            # A backup exists only after the formerly active generation moved
+            # out of place. It is the last generation known to predate this
+            # uncommitted activation, whether or not the new target is present.
+            if backup.exists():
+                remove_path(target)
+                backup.replace(target)
+            elif not had_previous and target.exists() and not staging.exists():
+                # A first install reached activation but not proof. Do not
+                # bless it merely because there is no generation to restore.
+                remove_path(target)
+        remove_path(staging)
+        journal.unlink(missing_ok=True)
+
+    # Staging directories never become authoritative without a journal. With
+    # the setup lock held, any leftovers here belong to a dead older worker.
+    for abandoned in ENGINE.glob(f".{name}.staging.*"):
+        remove_path(abandoned)
+
+    # Older releases had no journal. The only unambiguous orphan is a missing
+    # target beside a previous generation; restore the newest one rather than
+    # making the installation appear absent.
+    backups = sorted(
+        (item for item in ENGINE.glob(f"{name}.previous.*")
+         if item.is_dir() and not item.is_symlink()),
+        key=lambda item: item.stat().st_mtime_ns, reverse=True,
+    )
+    if not target.exists() and backups:
+        backups[0].replace(target)
+
+
+def prune_engine_backups(name: str, keep: int = 1) -> None:
+    backups = sorted(ENGINE.glob(f"{name}.previous.*"),
+                     key=lambda item: item.lstat().st_mtime_ns, reverse=True)
+    for old in backups[keep:]:
+        remove_path(old)
+
+
+def install_engine_transaction(name: str, builder, *, after_activate=None) -> None:
+    """Build privately, activate atomically, prove, and roll back on failure."""
+    target = ENGINE / name
+    staging = ENGINE / f".{name}.staging.{os.getpid()}"
+    backup = ENGINE / f"{name}.previous.{time.time_ns()}"
+    journal = ENGINE / f".{name}.transaction.json"
+    ENGINE.mkdir(parents=True, exist_ok=True)
+    recover_engine_transaction(name)
+    remove_path(staging)
+    had_previous = target.exists()
+    transaction = {
+        "name": name,
+        "staging": str(staging),
+        "backup": str(backup),
+        "hadPrevious": had_previous,
+        "phase": "activating",
+    }
+    try:
+        builder(staging)
+        if staging.is_symlink() or not staging.is_dir():
+            raise RuntimeError(f"Engine builder produced an unsafe staging path: {staging}")
+        replace_json(journal, transaction)
+        if had_previous:
+            target.replace(backup)
+        try:
+            staging.replace(target)
+        except BaseException:
+            if had_previous and backup.exists() and not target.exists():
+                backup.replace(target)
+            raise
+        try:
+            if after_activate is not None:
+                after_activate()
+            prove(name)
+            replace_json(journal, {**transaction, "phase": "proved"})
+        except BaseException:
+            remove_path(target)
+            if had_previous and backup.exists():
+                backup.replace(target)
+            raise
+        remove_path(backup)
+        journal.unlink(missing_ok=True)
+        # A successfully proved replacement no longer needs rollback copies.
+        # Engine environments are large, so do not retain an unrelated stale
+        # generation merely because it predates this transaction.
+        prune_engine_backups(name, keep=0)
+    finally:
+        # This also resolves partially completed filesystem moves before the
+        # worker publishes its terminal status. If the process is killed too
+        # hard to run finally, the same journal is consumed on the next run.
+        recover_engine_transaction(name)
+
+
+def worker(target: str) -> int:
+    global JOB_PID, JOB_IDENTITY, JOB_TARGET
+    try:
+        lock_fd = claim_inherited_setup_lock()
+    except (OSError, RuntimeError) as exc:
+        print(f"speak-setup: {exc}", file=sys.stderr)
+        return 1
+    JOB_PID = os.getpid()
+    if os.getpgrp() != JOB_PID:
+        print("speak-setup: worker does not own a private process group", file=sys.stderr)
+        os.close(lock_fd)
+        return 1
+    JOB_IDENTITY = process_identity(JOB_PID)
+    JOB_TARGET = target
+    signal.signal(signal.SIGTERM, cancel_worker_signal)
+    signal.signal(signal.SIGINT, cancel_worker_signal)
+    try:
+        write_state("running", "prepare", 2, "Preparing setup", target=target)
+        try:
+            if target == "easyocr":
+                install_engine_transaction("easyocr", build_easyocr)
+            elif target.startswith(LANGUAGE_PREFIX):
+                install_language(target[len(LANGUAGE_PREFIX):])
+                prove(target)
+            else:
+                raise RuntimeError("Unknown installation target")
+            write_state("done", "complete", 100, "Ready")
+            return 0
+        except SetupCancelled:
+            write_state("cancelled", "cancelled", 0, "Cancelled",
+                        pid=0, processIdentity="", cancellable=False)
+            return 130
+        except Exception as exc:  # boundary: convert backend failures to UI state
+            write_state("error", "failed", 0, str(exc), retryable=True)
+            return 1
+    finally:
+        os.close(lock_fd)
+
+
+def worker_command(target: str) -> list[str]:
+    return [sys.executable, str(Path(__file__).resolve()), "_worker", target]
+
+
+def start(target: str) -> None:
+    if target.startswith(LANGUAGE_PREFIX):
+        try:
+            language_package(target[len(LANGUAGE_PREFIX):])
+        except RuntimeError as exc:
+            emit(ok=False, code="unknown_target", message=str(exc))
+            return
+    elif target not in OCR_ENGINES:
+        emit(ok=False, code="unknown_target", message="Unknown installation target")
+        return
+    try:
+        lock_fd = open_private_lock(SETUP_LOCK)
+    except (OSError, RuntimeError):
+        emit(ok=False, code="lock_error", message="Setup lock is unavailable")
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        emit(ok=False, code="already_running", message="Setup is already running")
+        return
+    try:
+        current = read_small_json(STATE)
+        if not isinstance(current, dict):
+            raise ValueError("invalid setup state")
+        pid = int(current.get("pid", 0))
+        identity = str(current.get("processIdentity", ""))
+        if current.get("status") in {"starting", "running"} and pid > 1 \
+                and identity and process_identity(pid) == identity \
+                and process_group(pid) == pid:
+            emit(ok=False, code="already_running", message="Setup is already running")
+            os.close(lock_fd)
+            return
+    except (OSError, ValueError, TypeError):
+        pass
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    write_state("starting", "prepare", 1, "Preparing setup", target=target)
+    try:
+        worker_environment = os.environ.copy()
+        worker_environment[SETUP_LOCK_FD_ENV] = str(lock_fd)
+        process = subprocess.Popen(
+            worker_command(target),
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(lock_fd,),
+            env=worker_environment,
+        )
+    except OSError:
+        os.close(lock_fd)
+        write_state("error", "failed", 0,
+                    "Setup worker could not be launched", retryable=True)
+        emit(ok=False, code="worker_start_failed",
+             message="Setup could not start safely")
+        return
+    os.close(lock_fd)
+    # Do not tell the panel that setup is cancellable until the child has
+    # published both its PID and process-start identity. Without this handoff,
+    # an immediate Cancel could acknowledge success while the unregistered
+    # installer continued in the background.
+    registered = False
+    registered_identity = ""
+    for _ in range(200):
+        try:
+            child_state = read_small_json(STATE)
+            if not isinstance(child_state, dict):
+                raise ValueError("invalid setup state")
+            registered_identity = str(child_state.get("processIdentity", ""))
+            registered = (int(child_state.get("pid", 0)) == process.pid
+                          and bool(registered_identity)
+                          and process_group(process.pid) == process.pid)
+        except (OSError, ValueError, TypeError):
+            registered = False
+        if registered or process.poll() is not None:
+            break
+        time.sleep(0.01)
+    if not registered:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        write_state("error", "failed", 0,
+                    "Setup worker did not initialize safely", retryable=True)
+        emit(ok=False, code="worker_start_failed",
+             message="Setup could not start safely")
+        return
+    emit(ok=True, started=True, pid=process.pid,
+         processIdentity=registered_identity)
+
+
+def cancel() -> None:
+    try:
+        state = read_small_json(STATE)
+        if not isinstance(state, dict):
+            raise ValueError("invalid setup state")
+        pid = int(state.get("pid", 0))
+        identity = str(state.get("processIdentity", ""))
+        active = state.get("status") in {"starting", "running"}
+        cancellable = state.get("cancellable", True) is not False
+        if active and not cancellable:
+            emit(ok=False, code="not_cancellable",
+                 message="This package-manager step must finish before it can be cancelled")
+            return
+        if not (active and pid > 1 and identity
+                and process_identity(pid) == identity
+                and process_group(pid) == pid):
+            raise ValueError("no live setup worker")
+        os.killpg(pid, signal.SIGTERM)
+    except (OSError, ValueError, TypeError):
+        emit(ok=False, code="not_running", message="No setup job is running")
+        return
+    emit(ok=True, stopping=True)
+
+
+def job_status() -> None:
+    try:
+        current = read_small_json(STATE)
+    except (OSError, ValueError, TypeError):
+        emit(status="idle", step="", progress=0, message="")
+        return
+    if not isinstance(current, dict):
+        emit(status="idle", step="", progress=0, message="")
+        return
+    try:
+        pid = int(current.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    identity = str(current.get("processIdentity", ""))
+    current_status = str(current.get("status", ""))
+    if current_status in {"starting", "running"} and pid > 1 \
+            and (not identity or process_identity(pid) != identity
+                 or process_group(pid) != pid):
+        current.update(status="error", step="failed", progress=0,
+                       message="Setup stopped unexpectedly", retryable=True,
+                       pid=0, processIdentity="")
+        atomic_json(STATE, current)
+    emit(**current)
+
+
+def invalidate_health(provider: str) -> bool:
+    """Atomically forget proof affected by a credential mutation."""
+    keys = {provider}
+    if provider in {"openai", "google"}:
+        keys.add(f"ocr:{provider}")
+    if not HEALTH.exists():
+        return True
+    lock_fd: int | None = None
+    temporary: Path | None = None
+    try:
+        HEALTH.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = HEALTH.with_name(f"{HEALTH.name}.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            value = read_small_json(HEALTH, HEALTH_MAX_BYTES)
+        except (OSError, ValueError):
+            return True  # malformed cache entries are already treated as untested
+        if not isinstance(value, dict):
+            return True
+        for key in keys:
+            value.pop(key, None)
+        descriptor, name = tempfile.mkstemp(prefix=f".{HEALTH.name}.", dir=HEALTH.parent)
+        temporary = Path(name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, HEALTH)
+        temporary = None
+        return True
+    except OSError:
+        return False
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+
+
+def reset_account_state(provider: str) -> bool:
+    """Forget current TeraTTS voices; retired speech settings stay user-owned."""
+    if provider != "teratts":
+        return True
+    try:
+        (VOICE_CACHE / "teratts.json").unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def invalidate_credential_state(provider: str) -> bool:
+    health_ok = invalidate_health(provider)
+    account_ok = reset_account_state(provider)
+    return health_ok and account_ok
+
+
+def keyring_contains(tool: str, provider: str) -> bool:
+    """Return key presence while distinguishing absence from keyring failure."""
+    try:
+        result = subprocess.run(
+            [tool, "lookup", "service", "omarchy-tts", "key", provider],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            timeout=HELPER_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("The system keyring did not respond") from exc
+    if result.returncode == 0:
+        return True
+    # libsecret uses status 1 with no diagnostic for an absent item. Any other
+    # result is operational trouble, not proof that no credential exists.
+    if result.returncode == 1 and not result.stderr.strip():
+        return False
+    raise RuntimeError("The system keyring did not respond")
+
+
+def key_store(provider: str) -> None:
+    if provider not in CLOUD_KEYS:
+        emit(ok=False, code="unknown_provider", message="Unknown cloud provider")
+        return
+    raw_key = sys.stdin.readline(4098)
+    key = raw_key.rstrip("\r\n")
+    if (len(key) < 8 or len(key) > 4096
+            or any(not 33 <= ord(character) <= 126 for character in key)):
+        emit(ok=False, code="invalid_key", message="Enter a valid API key without surrounding whitespace")
+        return
+    tool = shutil.which("secret-tool")
+    if not tool:
+        emit(ok=False, code="no_keyring", message="The system keyring is unavailable")
+        return
+    try:
+        result = subprocess.run(
+            [tool, "store", f"--label=omarchy-tts {provider}",
+             "service", "omarchy-tts", "key", provider],
+            input=key, text=True, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=HELPER_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        key = ""
+        emit(ok=False, code="keyring_failed",
+             message="The system keyring did not respond")
+        return
+    key = ""
+    if result.returncode:
+        emit(ok=False, code="keyring_failed", message="Could not save the API key")
+    else:
+        invalidated = invalidate_credential_state(provider)
+        emit(ok=True, warning="" if invalidated else "Saved, but cached health could not be cleared")
+
+
+def key_remove(provider: str) -> None:
+    if provider not in CLOUD_KEYS:
+        emit(ok=False, code="unknown_provider", message="Unknown cloud provider")
+        return
+    tool = shutil.which("secret-tool")
+    if not tool:
+        emit(ok=False, code="no_keyring", message="The system keyring is unavailable")
+        return
+    try:
+        present = keyring_contains(tool, provider)
+    except RuntimeError as exc:
+        emit(ok=False, code="keyring_failed", message=str(exc))
+        return
+    if not present:
+        invalidated = invalidate_credential_state(provider)
+        emit(ok=True, code="not_found", message="No stored key was found",
+             warning="" if invalidated else "Cached health could not be cleared")
+        return
+    try:
+        result = subprocess.run(
+            [tool, "clear", "service", "omarchy-tts", "key", provider],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=HELPER_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        emit(ok=False, code="keyring_failed",
+             message="The system keyring did not respond")
+        return
+    if result.returncode:
+        emit(ok=False, code="keyring_failed",
+             message="Could not remove the stored API key")
+        return
+    invalidated = invalidate_credential_state(provider)
+    emit(ok=True, message="API key removed",
+         warning="" if invalidated else "Cached health could not be cleared")
+
+
+def diagnostics() -> None:
+    details = status()
+    details.update({
+        "version": json.loads((PLUGIN / "manifest.json").read_text()).get("version"),
+        "commands": {name: bool(shutil.which(name)) for name in
+                     ("wl-paste", "wl-copy", "grim", "slurp", "tesseract", "secret-tool", "mpv", "ffmpeg", "ffprobe")},
+        "provider": "configured",  # deliberately excludes selected/spoken text
+    })
+    emit(**details)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    start_parser = sub.add_parser("start")
+    start_parser.add_argument("target")
+    worker_parser = sub.add_parser("_worker")
+    worker_parser.add_argument("target")
+    sub.add_parser("job")
+    sub.add_parser("cancel")
+    key_parser = sub.add_parser("key-store")
+    key_parser.add_argument("provider")
+    remove_key_parser = sub.add_parser("key-remove")
+    remove_key_parser.add_argument("provider")
+    cleanup_parser = sub.add_parser("cleanup")
+    cleanup_parser.add_argument("--yes", action="store_true")
+    sub.add_parser("diagnostics")
+    args = parser.parse_args()
+    try:
+        ensure_private_runtime()
+    except (OSError, RuntimeError) as exc:
+        print(f"speak-setup: {exc}", file=sys.stderr)
+        emit(ok=False, code="runtime_error", message=str(exc))
+        return 1
+    if args.command == "status": emit(**status())
+    elif args.command == "start": start(args.target)
+    elif args.command == "_worker": return worker(args.target)
+    elif args.command == "job": job_status()
+    elif args.command == "cancel": cancel()
+    elif args.command == "key-store": key_store(args.provider)
+    elif args.command == "key-remove": key_remove(args.provider)
+    elif args.command == "cleanup":
+        # This fork shares shortcuts and the keyring namespace with the
+        # installed omarchy-tts copy. Neither resource has a per-plugin owner.
+        emit(ok=False, code="shared_state",
+             message="Cannot clean up shared shortcuts or API keys from the TeraTTS fork")
+        return 2
+    elif args.command == "diagnostics": diagnostics()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

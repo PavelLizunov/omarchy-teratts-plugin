@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# desc: A dedicated OCR server transcribes the capture.
+# title: OCR server
+# kind: remote
+# probe: command -v curl >/dev/null && jq -e '.ocr.remote.endpoint | type == "string" and length > 0' "$TTS_CONFIG" >/dev/null 2>&1
+# Reads a PNG or JPEG on stdin, writes recognised text on stdout.
+set -uo pipefail
+umask 077
+source "$TTS_PLUGIN_DIR/lib/play.sh"
+source "$TTS_PLUGIN_DIR/lib/cloud.sh"
+need curl "install with: omarchy pkg add curl"
+
+ENDPOINT="$(jq -r '.ocr.remote.endpoint // empty' "$TTS_CONFIG" 2>/dev/null)"
+if [[ ! "$ENDPOINT" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ &&
+      ! "$ENDPOINT" =~ ^http://(127[.]0[.]0[.]1|localhost|\[::1\])(:[0-9]{1,5})?$ ]]; then
+  printf 'OCR server: configure a valid HTTPS address first\n' >&2
+  exit 65
+fi
+
+if [[ "${1:-}" == "--health" ]]; then
+  health="$(curl -fsS --proto '=https,http' --noproxy '*' --connect-timeout 5 \
+    --max-time 10 --max-filesize 65536 "$ENDPOINT/healthz")" || exit 74
+  if ! jq -e '.status == "ok" and .ocr == "ready"' <<< "$health" >/dev/null 2>&1; then
+    printf 'OCR server: OCR is not ready\n' >&2
+    exit 74
+  fi
+  printf 'ready\n'
+  exit 0
+fi
+
+if [[ "${1:-}" == "--languages" ]]; then
+  printf '[{"value":"eng","label":"Any language (model decides)","installed":true}]\n'
+  exit 0
+fi
+
+[[ $# -eq 0 ]] || { printf 'OCR server: unsupported argument\n' >&2; exit 65; }
+IMAGE_MIME="${TTS_OCR_IMAGE_MIME:-image/png}"
+case "$IMAGE_MIME" in
+  image/png) extension=png ;;
+  image/jpeg) extension=jpg ;;
+  *) printf 'OCR server: only PNG and JPEG images are supported\n' >&2; exit 65 ;;
+esac
+
+work="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/omarchy-tts-ocr-remote.XXXXXX")" || exit 1
+img="$work/image"
+body="$work/body"
+headers="$work/headers"
+trap 'rm -f "$img" "$body" "$headers"; rmdir "$work"' EXIT
+head -c 52428801 > "$img" || {
+  printf 'OCR server: could not read image\n' >&2; exit 74;
+}
+[[ "$(stat -c%s "$img")" -le 52428800 && -s "$img" ]] || {
+  printf 'OCR server: image is empty or exceeds 50 MiB\n' >&2; exit 65;
+}
+curl_rc=0
+status="$(curl -sS --proto '=https,http' --noproxy '*' --connect-timeout 8 --max-time 120 \
+  --max-filesize 2097152 "$ENDPOINT/v1/ocr" \
+  --form "file=@$img;type=$IMAGE_MIME;filename=capture.$extension" \
+  --dump-header "$headers" --output "$body" --write-out '%{http_code}')" || curl_rc=$?
+if [[ $curl_rc -ne 0 ]]; then cloud_transport_fail 'OCR server' "$curl_rc"; exit $?; fi
+if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+  cloud_fail 'OCR server' "$status" "$body" "$headers"; exit $?
+fi
+if ! jq -e 'type == "object" and (.text | type == "string")' \
+    "$body" >/dev/null 2>&1; then
+  printf 'OCR server: invalid transcription\n' >&2; exit 74
+fi
+jq -r '.text' "$body"

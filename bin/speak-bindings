@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""Manage the small, explicitly-owned omarchy-tts block in bindings.lua.
+
+The tool never edits bindings outside its markers.  It backs up before every
+write and rolls back when Hyprland rejects the result.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+os.umask(0o077)
+
+BEGIN = "-- >>> omarchy-tts bindings"
+END = "-- <<< omarchy-tts bindings"
+PLUGIN = Path(__file__).resolve().parents[1]
+PLUGIN_ID = "io.github.pavellizunov.teratts"
+BINDINGS_CONFIG_MAX_BYTES = 1_048_576
+BINDINGS_SOURCE_MAX_BYTES = 8_388_608
+
+
+def read_regular_text(path: Path, maximum: int, *, errors: str = "strict") -> str:
+    """Read one bounded, owner-controlled regular file without following links."""
+    flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_size > maximum):
+            raise RuntimeError(f"Unsafe or oversized file: {path}")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        contents = b"".join(chunks)
+        if len(contents) > maximum:
+            raise RuntimeError(f"Unsafe or oversized file: {path}")
+        return contents.decode("utf-8", errors=errors)
+    finally:
+        os.close(descriptor)
+
+
+def open_private_lock(path: Path) -> int:
+    """Open an owner-only regular lock without following a symlink."""
+    flags = (os.O_CREAT | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"Could not open private lock: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Unsafe lock file: {path}")
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+
+
+# Managed bindings must name the logical plugin location, not whichever clone a
+# development symlink currently targets. That path survives both plugin updates
+# and intentional retargeting between production and development checkouts.
+SPEAK = str(config_home() / "omarchy" / "plugins" / PLUGIN_ID / "bin" / "speak")
+PREDECESSOR_SPEAK = str(config_home() / "omarchy/plugins/io.github.hikari112.tts/bin/speak")
+SPEAK_COMMAND = shlex.quote(SPEAK)
+DEFAULTS = {
+    "selection": {"chord": "SUPER + ALT + E", "command": f"{SPEAK_COMMAND} --toggle"},
+    "clipboard": {"chord": "SUPER + ALT + A", "command": f"{SPEAK_COMMAND} --clipboard"},
+    "stop": {"chord": "SUPER + ALT + X", "command": f"{SPEAK_COMMAND} --stop"},
+    "snip": {"chord": "SUPER + ALT + R", "command": f"{SPEAK_COMMAND} --snip"},
+    "window": {"chord": "SUPER + ALT + W", "command": f"{SPEAK_COMMAND} --window"},
+    "screen": {"chord": "SUPER + ALT + SHIFT + R", "command": f"{SPEAK_COMMAND} --screen"},
+    "export": {"chord": "", "command": f"{SPEAK_COMMAND} --export-audio --selection"},
+    "audio": {"chord": "SUPER + SHIFT + L", "command": f"{SPEAK_COMMAND} --show-audio"},
+    "pause": {"chord": "", "command": f"{SPEAK_COMMAND} --pause-toggle"},
+}
+
+
+def paths() -> tuple[Path, Path]:
+    home = config_home()
+    return home / "hypr" / "bindings.lua", home / "omarchy-tts" / "bindings.json"
+
+
+def load_config(path: Path) -> dict:
+    config = copy.deepcopy(DEFAULTS)
+    if not path.exists():
+        return config
+    try:
+        data = json.loads(read_regular_text(path, BINDINGS_CONFIG_MAX_BYTES))
+        if not isinstance(data, dict):
+            raise ValueError("bindings config must be an object")
+    except (OSError, ValueError, TypeError):
+        return config
+    for key in config:
+        stored = data.get(key, {})
+        if isinstance(stored, dict) and "chord" in stored:
+            try:
+                config[key]["chord"] = normalize_chord(str(stored["chord"])) if stored["chord"] else ""
+            except (ValueError, TypeError):
+                # One damaged choice must not silently discard every other
+                # valid customization in the file.
+                pass
+    return config
+
+
+def lua_string(value: str) -> str:
+    """Quote a value as one literal Lua string, including unusual XDG paths."""
+    escaped: list[str] = []
+    for character in value:
+        code = ord(character)
+        if character == "\\":
+            escaped.append("\\\\")
+        elif character == '"':
+            escaped.append('\\"')
+        elif code < 32 or code == 127:
+            # Lua decimal escapes consume at most three digits. Always writing
+            # all three prevents the following character from joining one.
+            escaped.append(f"\\{code:03d}")
+        else:
+            escaped.append(character)
+    return '"' + "".join(escaped) + '"'
+
+
+def shortcut_labels(locale: str) -> dict[str, str]:
+    labels = {}
+    for code in ("en", locale):
+        path = PLUGIN / "locales" / f"{code}.json"
+        try:
+            if path.stat().st_size > 65_536:
+                continue
+            catalog = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(catalog, dict):
+                continue
+            for action in DEFAULTS:
+                value = catalog.get(f"shortcut.{action}")
+                if isinstance(value, str) and value.strip():
+                    labels[action] = value
+        except (OSError, ValueError):
+            continue
+    return labels
+
+
+def render(config: dict, locale: str = "ru") -> str:
+    lines = [BEGIN, "-- Managed by speak-bindings. Edit through the TTS panel or CLI."]
+    labels = shortcut_labels(locale)
+    for action, item in config.items():
+        if not item["chord"]:
+            continue
+        lines.append(f"hl.unbind({lua_string(item['chord'])})")
+        lines.append(
+            f"o.bind({lua_string(item['chord'])}, {lua_string(labels.get(action, action))}, "
+            f"{lua_string(item['command'])})"
+        )
+    lines.append(END)
+    return "\n".join(lines)
+
+
+def normalize_chord(chord: str) -> str:
+    """Return the canonical Hyprland chord accepted by the QML capture UI."""
+    parts = [part.strip().upper() for part in chord.split("+")]
+    normalized = " + ".join(parts)
+    if not re.fullmatch(r"[A-Z0-9_]+(?: \+ [A-Z0-9_]+)*", normalized):
+        raise ValueError("shortcut contains unsupported characters")
+    keys = [part for part in parts if part not in MOD_MASKS]
+    modifiers = [part for part in parts if part in MOD_MASKS]
+    if len(keys) != 1 or len(modifiers) != len(set(modifiers)):
+        raise ValueError("shortcut must contain exactly one key and no repeated modifiers")
+    if len(normalized) > 80:
+        raise ValueError("shortcut is too long")
+    return normalized
+
+
+def replace_block(text: str, block: str | None) -> str:
+    if text.count(BEGIN) > 1 or text.count(END) > 1:
+        raise ValueError("bindings.lua has duplicate omarchy-tts marker blocks")
+    start, end = text.find(BEGIN), text.find(END)
+    if (start >= 0) != (end >= 0) or (start >= 0 and end < start):
+        raise ValueError("bindings.lua has incomplete omarchy-tts markers")
+    if start >= 0:
+        end = text.find("\n", end)
+        end = len(text) if end < 0 else end + 1
+        text = text[:start].rstrip() + "\n" + text[end:].lstrip("\n")
+    if block:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    return text
+
+
+# Flags only this tool's CLI accepts. A binding that runs a program called
+# "speak" with one of these is ours however it was written - by hand, by an
+# older README, through ~/.local/bin, or straight out of the plugin directory.
+OUR_FLAGS = {"--toggle", "--clipboard", "--stop", "--snip", "--window",
+             "--screen", "--selection", "--export-wav", "--export-audio", "--show-audio", "--pause-toggle"}
+FULL_BIND_LINE = re.compile(
+    r'^\s*o\.bind\(\s*"([^"]*)"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"\s*\)\s*$'
+)
+MANAGED_BIND_LINE = re.compile(
+    r'^\s*o\.bind\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)\s*$'
+)
+FLAG_ACTION = {"--toggle": "selection", "--selection": "selection",
+               "--clipboard": "clipboard", "--stop": "stop", "--snip": "snip",
+               "--window": "window", "--screen": "screen"}
+
+
+def is_our_command(command: str) -> bool:
+    """True when this command line invokes our speak CLI.
+
+    Deliberately strict: the executable must be the plugin's stable `speak`
+    path and carry one of our own flags, so an unrelated program with the same
+    basename is never adopted or removed.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    # A different program named `speak` is not ours. The exact documented
+    # one-line migration below handles old bare/~/bin invocations when their
+    # source line is available; active bindings from another sourced file are
+    # treated conservatively as conflicts.
+    if os.path.expanduser(parts[0]) not in (SPEAK, PREDECESSOR_SPEAK):
+        return False
+    return any(part in OUR_FLAGS for part in parts[1:])
+
+
+def legacy_command_action(command: str) -> str | None:
+    """Identify only command forms published by older plugin instructions."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if len(parts) != 2:
+        return None
+    executable = os.path.expanduser(parts[0])
+    documented_executable = (
+        parts[0] == "speak"
+        or executable == SPEAK
+        or executable == PREDECESSOR_SPEAK
+        or executable == str(Path.home() / ".local/bin/speak")
+    )
+    if not documented_executable:
+        return None
+    return FLAG_ACTION.get(parts[1])
+
+
+def documented_legacy_binding(line: str) -> tuple[str, str] | None:
+    """Return (chord, action) only for an exact shortcut we documented.
+
+    Custom speak commands or chords remain user-owned. Earlier code removed any
+    whole line containing a basename `speak` plus a familiar flag, which could
+    discard unrelated Lua or another program with the same name.
+    """
+    match = FULL_BIND_LINE.fullmatch(line)
+    if not match:
+        return None
+    chord, command = match.groups()
+    action = legacy_command_action(command)
+    if action is None or chord.upper() != DEFAULTS[action]["chord"]:
+        return None
+    return chord, action
+
+
+def adoptable_bindings(text: str) -> list[str]:
+    """Chords bound to our CLI outside the managed block."""
+    found = []
+    for line in text.splitlines():
+        legacy = documented_legacy_binding(line)
+        if legacy:
+            found.append(legacy[0])
+    return found
+
+
+def migrate_manual_tts_lines(text: str) -> str:
+    """Drop bindings that invoke our CLI, so they can be re-added as a block."""
+    kept = []
+    for line in text.splitlines():
+        if documented_legacy_binding(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).rstrip() + "\n"
+
+
+BIND_CHORD = re.compile(
+    r'^\s*(?:o|hl)\.bind\(\s*["\']([^"\']+)["\']', re.I | re.MULTILINE
+)
+
+
+def conflicting_chords(text: str, config: dict) -> list[str]:
+    """Find equivalent chords regardless of spacing or modifier order."""
+    occupied = set()
+    for match in BIND_CHORD.finditer(text):
+        try:
+            occupied.add(chord_signature(normalize_chord(match.group(1))))
+        except ValueError:
+            continue
+    return [item["chord"] for item in config.values()
+            if item["chord"] and chord_signature(item["chord"]) in occupied]
+
+
+def managed_chord_signatures(text: str) -> dict[tuple[int, str], str]:
+    """Recognize our marked commands and their visible Hyprland labels."""
+    start, end = text.find(BEGIN), text.find(END)
+    if start < 0 or end < start:
+        return {}
+    owned = {}
+    for line in text[start:end].splitlines():
+        match = MANAGED_BIND_LINE.fullmatch(line)
+        if match and is_our_command(match.group(3)):
+            try:
+                owned[chord_signature(normalize_chord(match.group(1)))] = match.group(2)
+            except ValueError:
+                pass
+    return owned
+
+
+MOD_MASKS = {"SHIFT": 1, "CTRL": 4, "ALT": 8, "SUPER": 64}
+
+
+def chord_signature(chord: str) -> tuple[int, str]:
+    parts = [part.strip().upper() for part in chord.split("+")]
+    modifiers = sum(MOD_MASKS.get(part, 0) for part in parts)
+    keys = [part for part in parts if part not in MOD_MASKS]
+    return modifiers, keys[-1] if keys else ""
+
+
+def active_conflicting_chords(config: dict,
+                              owned: dict[tuple[int, str], str] | None = None) -> list[str]:
+    """Chords already active through defaults or another sourced Lua file."""
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or not shutil.which("hyprctl"):
+        return []
+    try:
+        result = subprocess.run(["hyprctl", "binds", "-j"], text=True,
+                                capture_output=True, timeout=3, check=True)
+        active = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # When Hyprland is live, failing open can overwrite a shortcut sourced
+        # from another Lua file. An unavailable inspection is a safe refusal,
+        # not evidence that the chord is unused.
+        raise RuntimeError("Could not inspect active Hyprland shortcuts") from exc
+    occupied = set()
+    own_active = set()
+    owned = owned or {}
+    if not isinstance(active, list):
+        raise RuntimeError("Hyprland returned an unreadable shortcut list")
+    for binding in active:
+        if not isinstance(binding, dict):
+            continue
+        try:
+            modmask = int(binding.get("modmask", 0))
+        except (TypeError, ValueError):
+            continue
+        signature = (modmask, str(binding.get("key", "")).upper())
+        command = str(binding.get("arg", ""))
+        if is_our_command(command):
+            own_active.add(signature)
+            continue
+        # Omarchy's Lua dispatcher exposes a numeric callback ID in hyprctl,
+        # not the command. One matching binding from our verified marker block
+        # is ours; a second entry on that chord remains a real conflict.
+        if (binding.get("dispatcher") == "__lua"
+                and signature in owned
+                and binding.get("description") == owned.get(signature)
+                and signature not in own_active):
+            own_active.add(signature)
+            continue
+        legacy_action = legacy_command_action(command)
+        if (legacy_action is not None
+                and signature in owned and signature not in own_active
+                and signature == chord_signature(DEFAULTS[legacy_action]["chord"])):
+            own_active.add(signature)
+            continue
+        occupied.add(signature)
+    return [item["chord"] for item in config.values()
+            if item["chord"] and chord_signature(item["chord"]) in occupied]
+
+
+def duplicate_chords(config: dict) -> list[str]:
+    """Find collisions among the six shortcuts being managed together."""
+    seen: set[tuple[int, str]] = set()
+    duplicates: list[str] = []
+    for item in config.values():
+        if not item["chord"]:
+            continue
+        signature = chord_signature(item["chord"])
+        if signature in seen and item["chord"] not in duplicates:
+            duplicates.append(item["chord"])
+        seen.add(signature)
+    return duplicates
+
+
+def all_conflicts(text: str, config: dict,
+                  owned: dict[tuple[int, str], str] | None = None) -> list[str]:
+    return list(dict.fromkeys(conflicting_chords(text, config)
+                              + active_conflicting_chords(config, owned)
+                              + duplicate_chords(config)))
+
+
+def validate_or_restore(target: Path, backup: Path) -> None:
+    if shutil.which("hyprctl") is None or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    try:
+        reload_result = subprocess.run(["hyprctl", "reload"], capture_output=True,
+                                       text=True, timeout=5)
+        errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True,
+                                text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        atomic_write_text(target, read_regular_text(
+            backup, BINDINGS_SOURCE_MAX_BYTES, errors="replace"),
+                          backup.stat().st_mode & 0o777)
+        try:
+            subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise RuntimeError("Hyprland did not finish validating the shortcuts") from exc
+    if reload_result.returncode or errors.returncode or errors.stdout.strip():
+        atomic_write_text(target, read_regular_text(
+            backup, BINDINGS_SOURCE_MAX_BYTES, errors="replace"),
+                          backup.stat().st_mode & 0o777)
+        try:
+            subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        message = (errors.stdout.strip() or errors.stderr.strip()
+                   or reload_result.stderr.strip() or "Hyprland rejected the file")
+        raise RuntimeError(message)
+
+
+def atomic_write_text(path: Path, content: str, mode: int) -> None:
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_target(path: Path) -> Path:
+    """Follow an existing dotfile symlink without replacing the link itself."""
+    if path.is_symlink():
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"Refusing to replace dangling symlink: {path}") from exc
+        if not resolved.is_file():
+            raise RuntimeError(f"Symlink target is not a file: {path}")
+        return resolved
+    if path.exists() and not path.is_file():
+        raise RuntimeError(f"Refusing non-regular configuration path: {path}")
+    return path
+
+
+def write(target: Path, content: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    actual = write_target(target)
+    existed = actual.exists()
+    if not existed:
+        actual.write_text("-- Personal keybindings\n")
+    backup = actual.with_name(f"{actual.name}.tts.bak.{time.time_ns()}")
+    shutil.copy2(actual, backup)
+    mode = actual.stat().st_mode & 0o777
+    atomic_write_text(actual, content, mode)
+    try:
+        validate_or_restore(actual, backup)
+    except Exception:
+        if not existed:
+            actual.unlink(missing_ok=True)
+        raise
+    finally:
+        backups = sorted(actual.parent.glob(f"{actual.name}.tts.bak.*"),
+                         key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        for old in backups[3:]:
+            old.unlink(missing_ok=True)
+
+
+def save_config(path: Path, config: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = write_target(path)
+    choices = {key: {"chord": value["chord"]} for key, value in config.items()}
+    if path.exists():
+        try:
+            previous = json.loads(read_regular_text(path, BINDINGS_CONFIG_MAX_BYTES))
+            if not isinstance(previous, dict):
+                raise ValueError("bindings config must be an object")
+        except (ValueError, TypeError):
+            invalid = path.with_name(f"{path.name}.invalid.{time.time_ns()}")
+            path.replace(invalid)
+            invalid.chmod(0o600)
+    atomic_write_text(path, json.dumps(choices, indent=2) + "\n", 0o600)
+
+
+def execute(args: argparse.Namespace, target: Path, config_path: Path) -> int:
+    config = load_config(write_target(config_path))
+    readable_target = write_target(target)
+    full_text = (read_regular_text(readable_target, BINDINGS_SOURCE_MAX_BYTES,
+                                   errors="replace") if readable_target.exists()
+                 else "-- Personal keybindings\n")
+    without_block = replace_block(full_text, None)
+    owned = managed_chord_signatures(full_text)
+    # A documented manual binding is about to be adopted. Match its real Lua
+    # label just as for a managed binding; hyprctl only exposes a callback ID.
+    # active_conflicting_chords consumes at most one such match per chord, so
+    # a second live binding on that chord still prevents installation.
+    if args.command == "install" or (args.command == "status" and BEGIN not in full_text):
+        for line in without_block.splitlines():
+            if documented_legacy_binding(line):
+                match = MANAGED_BIND_LINE.fullmatch(line)
+                owned[chord_signature(normalize_chord(match[1]))] = match[2]
+
+    if args.command == "status":
+        installed = BEGIN in full_text
+        # Exact shortcuts from older README versions are safe to adopt into
+        # our managed block; do not present them as user conflicts.
+        conflict_source = without_block if installed else migrate_manual_tts_lines(without_block)
+        conflicts = all_conflicts(conflict_source, config, owned)
+        adoptable = [] if installed else adoptable_bindings(without_block)
+        print(json.dumps({"installed": installed, "bindings": config,
+                          "conflicts": conflicts, "adoptable": adoptable,
+                          "canInstall": not conflicts}))
+        return 0
+    if args.command == "set":
+        candidate = copy.deepcopy(config)
+        candidate[args.action]["chord"] = normalize_chord(args.chord) if args.chord else ""
+        conflicts = all_conflicts(without_block, candidate, owned)
+        if conflicts:
+            raise ValueError("shortcut already used: " + ", ".join(conflicts))
+        block = render(candidate, args.locale) if BEGIN in full_text else None
+        config_actual = write_target(config_path)
+        config_existed = config_actual.exists()
+        previous_config = (read_regular_text(config_actual, BINDINGS_CONFIG_MAX_BYTES)
+                           if config_existed else "")
+        previous_mode = (config_actual.stat().st_mode & 0o777) if config_existed else 0o600
+        save_config(config_path, candidate)
+        try:
+            if block:
+                write(target, replace_block(without_block, block))
+        except Exception:
+            if config_existed:
+                atomic_write_text(config_actual, previous_config, previous_mode)
+            else:
+                config_actual.unlink(missing_ok=True)
+            raise
+        print("updated")
+        return 0
+    original = without_block
+    if args.command == "remove" and BEGIN not in full_text:
+        print("removed")
+        return 0
+    if args.command == "install":
+        original = migrate_manual_tts_lines(original)
+    block = None if args.command == "remove" else render(config, args.locale)
+    conflicts = all_conflicts(original, config, owned) if block else []
+    if conflicts:
+        raise ValueError("shortcut already used outside the TTS block: " + ", ".join(conflicts))
+    write(target, replace_block(original, block))
+    print("removed" if block is None else "installed")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--locale", choices=("ru", "en"), default="ru")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    sub.add_parser("install")
+    sub.add_parser("remove")
+    set_parser = sub.add_parser("set")
+    set_parser.add_argument("action", choices=DEFAULTS)
+    set_parser.add_argument("chord")
+    args = parser.parse_args()
+    target, config_path = paths()
+
+    # An install and a shortcut edit update two files as one logical action.
+    # Serialize CLI and panel callers so neither can derive its write from a
+    # stale snapshot of the other one's changes.
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open_private_lock(config_path.with_suffix(".lock"))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return execute(args, target, config_path)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"speak-bindings: {exc}", file=sys.stderr)
+        raise SystemExit(1)

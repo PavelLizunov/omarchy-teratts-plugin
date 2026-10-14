@@ -1,0 +1,1617 @@
+#!/usr/bin/env bash
+# speak - read text aloud through a pluggable TTS provider.
+#
+# Providers are executables that read text on stdin and play it. User
+# providers in ~/.config/omarchy-tts/providers/ shadow the bundled ones,
+# so bringing your own voice means dropping in a file.
+
+set -uo pipefail
+umask 077
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-tts"
+CONFIG="$USER_DIR/config.json"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-tts"
+STATE_DIR="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/omarchy-tts}"
+# Without a session runtime dir, fall back to an owner-only XDG state
+# directory rather than sticky /tmp, so runtime PID state is never in a
+# location another user can pre-populate.
+STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-tts/run}"
+PID_FILE="$STATE_DIR/pgid"
+PREP_FILE="$STATE_DIR/preparing"
+STATUS_FILE="$STATE_DIR/status"
+ACTIVE_PROVIDER_FILE="$STATE_DIR/provider"
+SPEECH_LOCK="$STATE_DIR/speech.lock"
+SANITIZER="$PLUGIN_DIR/lib/sanitize.py"
+INPUT_MAX_BYTES=1048576
+CAPTURE_MAX_BYTES=52428800
+METADATA_MAX_BYTES=2097152
+export TTS_STATE_DIR="$STATE_DIR"
+JOB_KIND="${TTS_JOB_KIND:-speech}"
+JOB_ID=""
+
+# Resolved from the installed plugin directory.
+# shellcheck disable=SC1091
+source "$PLUGIN_DIR/lib/config.sh"
+# shellcheck disable=SC1091
+source "$PLUGIN_DIR/lib/health.sh"
+# shellcheck disable=SC1091
+source "$PLUGIN_DIR/lib/keys.sh"
+
+die() { printf 'speak: %s\n' "$*" >&2; exit 1; }
+
+cfg() { # cfg <json-path> <fallback>
+  local v=""
+  [[ -r "$CONFIG" ]] && v="$(jq -r "$1 // empty" "$CONFIG" 2>/dev/null)"
+  [[ -n "$v" && "$v" != "null" ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+
+notify() { # Catalog message key; never expose helper stderr or request text.
+  local key="$1" locale="${TTS_UI_LOCALE:-ru}" title body
+  [[ "$locale" == en ]] || locale=ru
+  title="$(jq -r --arg key "notify.$key.title" '.[$key] // empty' "$PLUGIN_DIR/locales/$locale.json")"
+  body="$(jq -r --arg key "notify.$key.body" '.[$key] // empty' "$PLUGIN_DIR/locales/$locale.json")"
+  [[ -n "$title" && -n "$body" ]] || return 0
+  command -v notify-send >/dev/null 2>&1 && notify-send -a TeraTTS "$title" "$body" 2>/dev/null
+}
+
+atomic_state_write() { # path, one-line value
+  local path="$1" value="$2" tmp
+  tmp="$(mktemp "$STATE_DIR/.${path##*/}.XXXXXX")" || return 1
+  if printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -T -- "$tmp" "$path"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+small_runtime_value() { # path maximum-bytes
+  local path="$1" maximum="$2" value=""
+  [[ ! -L "$path" && -f "$path" &&
+     "$(stat -c%s "$path" 2>/dev/null || printf '%s' "$((maximum + 1))")" \
+       -le "$maximum" ]] || return 1
+  IFS= read -r value < "$path" || [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
+process_identity() { # process_identity <pid> -> Linux start-time field
+  local pid="$1" stat_line rest
+  local -a fields
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  IFS= read -r stat_line 2>/dev/null < "/proc/$pid/stat" || return 1
+  # comm is parenthesized and may contain spaces or ')'; remove through the
+  # final ") " before indexing the stable fields that follow it.
+  rest="${stat_line##*) }"
+  read -r -a fields <<< "$rest"
+  [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[19]}"
+}
+
+process_group() { # process_group <pid> -> Linux process-group ID
+  local pid="$1" stat_line rest
+  local -a fields
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  IFS= read -r stat_line 2>/dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -r -a fields <<< "$rest"
+  [[ "${fields[2]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[2]}"
+}
+
+set_status() {
+  atomic_state_write "$STATUS_FILE" "$1"
+}
+
+provider_path() { # first match wins: user overrides bundled
+  local name="$1"
+  [[ "$name" == teratts ]] || return 1
+  [[ -f "$PLUGIN_DIR/providers/teratts" && -x "$PLUGIN_DIR/providers/teratts" ]] && { printf '%s' "$PLUGIN_DIR/providers/teratts"; return 0; }
+  return 1
+}
+
+provider_names() {
+  printf 'teratts\n'
+}
+
+cycle_provider() {
+  local cur next
+  cur="$(cfg .provider teratts)"
+  next="$(provider_names | awk -v c="$cur" '
+    { a[NR]=$0 } END { for (i=1;i<=NR;i++) if (a[i]==c) { print a[i%NR+1]; exit } print a[1] }')"
+  [[ -z "$next" ]] && return 1
+  tts_config_set .provider "$next" || return 1
+  printf '%s\n' "$next"
+}
+
+ocr_engine_path() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  for d in "$USER_DIR/ocr" "$PLUGIN_DIR/ocr"; do
+    [[ -f "$d/$name" && -x "$d/$name" ]] && { printf '%s' "$d/$name"; return 0; }
+  done
+  return 1
+}
+
+# capture <snip|window|screen|clipboard-image> [mime] -> image on stdout
+capture() {
+  local mode="$1" requested_mime="${2:-}" geom="" mon=""
+  case "$mode" in
+    snip)
+      command -v slurp >/dev/null 2>&1 || { echo "speak: slurp not installed" >&2; return 1; }
+      # Freeze the screen first, so the grab matches what was on screen when
+      # the region was drawn rather than whatever moved underneath.
+      local pid=""
+      if command -v hyprpicker >/dev/null 2>&1; then
+        hyprpicker -r -z >/dev/null 2>&1 &
+        pid=$!
+        sleep 0.1
+      fi
+      geom="$(slurp 2>/dev/null)"
+      if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+      fi
+      [[ -z "$geom" ]] && return 2          # user cancelled: not an error
+      grim -g "$geom" - 2>/dev/null
+      ;;
+    window)
+      geom="$(hyprctl activewindow -j 2>/dev/null |
+        jq -r 'if .at then "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" else empty end')"
+      [[ -z "$geom" ]] && { echo "speak: no active window" >&2; return 1; }
+      grim -g "$geom" - 2>/dev/null
+      ;;
+    screen)
+      mon="$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' | head -1)"
+      [[ -n "$mon" ]] || {
+        echo "speak: could not identify the focused monitor" >&2; return 1;
+      }
+      grim -o "$mon" - 2>/dev/null
+      ;;
+    clipboard-image)
+      local mime=""
+      mime="$requested_mime"
+      [[ "$mime" =~ ^image/(png|jpeg|webp|bmp|tiff)$ ]] || mime=""
+      [[ -n "$mime" ]] || { echo "speak: clipboard has no supported image" >&2; return 1; }
+      wl-paste --type "$mime" 2>/dev/null
+      ;;
+  esac
+}
+
+list_providers() {
+  local current n f origin mark
+  current="$(cfg .provider teratts)"
+  while read -r n; do
+    f="$(provider_path "$n")" || continue
+    origin="bundled"
+    [[ "$f" == "$USER_DIR/providers/"* ]] && origin="user"
+    mark="  "; [[ "$n" == "$current" ]] && mark="* "
+    printf '%s%-14s %-8s %s\n' "$mark" "$n" "$origin" "$(meta_of "$f" desc)"
+  done < <(provider_names)
+}
+
+meta_of() { # meta_of <file> <field>
+  sed -n "s/^# $2: //p" "$1" | head -1
+}
+
+# A probe answers "is it installed", which is not the same as "does it work".
+# Kokoro passed its probe while unable to synthesise a single sample, was
+# selected as default, and silently killed every keybinding. So installation
+# and proof are tracked separately, and only proof earns the word "ready".
+HEALTH="$CACHE_DIR/health.json"
+CLOUD_DIR="$CACHE_DIR/cloud"
+
+cloud_metrics_of() { # cloud_metrics_of <provider>
+  local file="$CLOUD_DIR/$1.json"
+  [[ ! -L "$file" && -s "$file" &&
+     "$(stat -c%s "$file" 2>/dev/null || printf 2097153)" -le 2097152 ]] &&
+    jq -c 'if type == "object" then . else {} end' "$file" 2>/dev/null || printf '{}'
+}
+
+key_name_of() { # logical-name executable -> keyring account name or empty
+  local name="$1" bin="${2:-}" key_name=""
+  [[ -n "$bin" ]] && key_name="$(meta_of "$bin" keyname)"
+  if [[ -z "$key_name" ]]; then
+    case "$name" in openai|elevenlabs|google|gemini) key_name="$name" ;; esac
+  fi
+  printf '%s' "$key_name"
+}
+
+key_env_of() { # logical-name executable -> environment variable or empty
+  local name="$1" bin="${2:-}" env_name="" key_name
+  [[ -n "$bin" ]] && env_name="$(meta_of "$bin" keyenv)"
+  if [[ -z "$env_name" ]]; then
+    key_name="$(key_name_of "$name" "$bin")"
+    case "$key_name" in
+      openai) env_name=OPENAI_API_KEY ;;
+      elevenlabs) env_name=ELEVENLABS_API_KEY ;;
+      google) env_name=GOOGLE_API_KEY ;;
+      gemini) env_name=GEMINI_API_KEY ;;
+    esac
+  fi
+  [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && printf '%s' "$env_name"
+}
+
+key_state() { # logical-name [executable] -> source<TAB>non-secret identity
+  local name="$1" bin="${2:-}" env_name key_name value="" digest="" error_file rc=0
+  key_name="$(key_name_of "$name" "$bin")"
+  [[ -n "$key_name" ]] || { printf 'none\t'; return; }
+  env_name="$(key_env_of "$name" "$bin")"
+  if [[ -n "$env_name" ]]; then
+    value="${!env_name:-}"
+    if key_value_valid "$value"; then
+      digest="$(printf '%s' "$value" | sha256sum | awk '{print $1}')"
+      value=""
+      printf 'env\t%s' "$digest"; return
+    fi
+  fi
+  if command -v secret-tool >/dev/null 2>&1; then
+    error_file="$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/omarchy-tts-key.XXXXXX")" || {
+      printf 'keyerror\t'; return;
+    }
+    value="$(timeout --kill-after=1s 2s secret-tool lookup \
+      service omarchy-tts key "$key_name" 2>"$error_file")" || rc=$?
+    if [[ $rc -eq 0 ]] && key_value_valid "$value"; then
+      digest="$(printf '%s' "$value" | sha256sum | awk '{print $1}')"
+      value=""
+      rm -f "$error_file"
+      printf 'keyring\t%s' "$digest"; return
+    fi
+    value=""
+    if [[ $rc -ne 1 || -s "$error_file" ]]; then
+      rm -f "$error_file"; printf 'keyerror\t'; return
+    fi
+    rm -f "$error_file"
+  else
+    # Without the keyring client we cannot distinguish an absent credential
+    # from one that is safely stored but temporarily inaccessible. Reporting
+    # `none` here invites the UI to tell the user to save a duplicate key and
+    # masks an incomplete installation; surface the operational error instead.
+    printf 'keyerror\t'; return
+  fi
+  printf 'none\t'
+}
+
+health_fingerprint() { # health-key [executable] [credential-source] [credential-identity]
+  local key="$1" bin="${2:-}" source="${3:-}" credential_identity="${4:-}" name config_part exec_stamp
+  if [[ "$key" == ocr:* ]]; then
+    name="${key#ocr:}"
+    [[ -n "$bin" ]] || bin="$(ocr_engine_path "$name")" || return 1
+    config_part="$(jq -c --arg name "$name" '.ocr[$name] // {}' "$CONFIG" 2>/dev/null)" || return 1
+  else
+    name="$key"
+    [[ -n "$bin" ]] || bin="$(provider_path "$name")" || return 1
+    config_part="$(jq -c --arg name "$name" '{settings:(.[$name] // {}), rate:(.rate // 1.0)}' "$CONFIG" 2>/dev/null)" || return 1
+  fi
+  if [[ -z "$source" ]]; then
+    IFS=$'\t' read -r source credential_identity < <(key_state "$name" "$bin")
+  fi
+  exec_stamp="$(stat -Lc '%d:%i:%s:%y' "$bin" 2>/dev/null)" || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n' "$key" "$exec_stamp" "$config_part" "$source" "$credential_identity" |
+    sha256sum | awk '{print $1}'
+}
+
+health_of() { # health_of <key> [executable] [credential-source]
+  [[ ! -L "$HEALTH" && -s "$HEALTH" &&
+     "$(stat -c%s "$HEALTH" 2>/dev/null || printf 1048577)" -le 1048576 ]] || {
+    printf 'untested'; return;
+  }
+  local key="$1" expected status stored
+  expected="$(health_fingerprint "$@")" || { printf 'untested'; return; }
+  IFS=$'\t' read -r status stored < <(
+    jq -r --arg key "$key" '[.[$key].status // "untested", .[$key].fingerprint // ""] | @tsv' \
+      "$HEALTH" 2>/dev/null
+  )
+  if [[ -n "$stored" && "$stored" == "$expected" ]]; then
+    case "$status" in ok|failed) printf '%s' "$status"; return ;; esac
+  fi
+  printf 'untested'
+}
+
+health_set() { # health_set <provider> <ok|failed> [note] [fingerprint]
+  mkdir -p "$CACHE_DIR" || return 1
+  chmod 700 "$CACHE_DIR" 2>/dev/null || return 1
+  local lock_fd tmp initial fingerprint="${4:-}" rc=0
+  if [[ $# -lt 4 ]]; then
+    fingerprint="$(health_fingerprint "$1")" || return 1
+  fi
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || return 1
+  exec {lock_fd}>>"${HEALTH}.lock" || return 1
+  flock "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+  if [[ -L "$HEALTH" || ! -s "$HEALTH" ||
+        "$(stat -c%s "$HEALTH" 2>/dev/null || printf 1048577)" -gt 1048576 ]] ||
+      ! jq -e 'type == "object"' "$HEALTH" >/dev/null 2>&1; then
+    if ! initial="$(mktemp "${HEALTH}.XXXXXX")"; then
+      flock -u "$lock_fd"
+      exec {lock_fd}>&-
+      return 1
+    fi
+    if ! printf '{}\n' > "$initial" || ! chmod 600 "$initial" || ! mv -T -- "$initial" "$HEALTH"; then
+      rm -f "$initial"
+      flock -u "$lock_fd"
+      exec {lock_fd}>&-
+      return 1
+    fi
+  fi
+  if ! tmp="$(mktemp "${HEALTH}.XXXXXX")"; then
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return 1
+  fi
+  if jq --arg p "$1" --arg s "$2" --arg n "${3:-}" --arg t "$(date -Is)" \
+        --arg fingerprint "$fingerprint" \
+        '.[$p] = {status:$s, note:$n, at:$t, fingerprint:$fingerprint}' \
+        "$HEALTH" > "$tmp" 2>/dev/null && chmod 600 "$tmp" && mv -T -- "$tmp" "$HEALTH"; then
+    :
+  else
+    rm -f "$tmp"
+    rc=1
+  fi
+  flock -u "$lock_fd"
+  exec {lock_fd}>&-
+  return "$rc"
+}
+
+provider_installed() { # 0 if the probe passes
+  local probe; probe="$(meta_of "$1" probe)"
+  [[ -z "$probe" ]] && return 0
+  timeout --kill-after=1s 3s env TTS_PLUGIN_DIR="$PLUGIN_DIR" \
+    TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" bash -c "$probe" >/dev/null 2>&1
+}
+
+provider_status() { # provider executable, pre-read health, credential source
+  local bin="$1" health="$2" credential_source="${3:-none}" kind
+  kind="$(meta_of "$bin" kind)"
+  if [[ "$kind" == "cloud" ]]; then
+    [[ "$credential_source" != keyerror ]] || { printf 'keyerror'; return; }
+    [[ "$credential_source" != none ]] || { printf 'nokey'; return; }
+  elif ! provider_installed "$bin"; then
+    printf 'missing'; return
+  fi
+  case "$health" in
+    ok)     printf 'ready' ;;
+    failed) printf 'failing' ;;
+    *)      printf 'untested' ;;
+  esac
+}
+
+# Prove a provider by making it speak into the void. Exit status is the
+# signal: a backend that cannot synthesise exits non-zero or hangs.
+# 0 = proved working, 1 = installed but broken, 2 = not installed to test
+verify_provider() { # verify_provider <name>
+  local name="$1" bin verify_voice fingerprint="" error_file rc=0
+  bin="$(provider_path "$name")" || return 2
+  # Absent is not the same as broken; do not record health for it.
+  provider_installed "$bin" || return 2
+  verify_voice="$(voice_for_provider "$name")"
+  # Associate the result with what was actually tested. If configuration or
+  # the adapter changes while a slow provider runs, this proof must be stale
+  # immediately rather than blessing the replacement configuration.
+  fingerprint="$(health_fingerprint "$name" "$bin" || true)"
+  error_file="$(mktemp "$STATE_DIR/.verify-provider.XXXXXX")" || return 1
+  # shellcheck disable=SC2016  # $0 must expand in the inner shell, not here
+  timeout --kill-after=5s 90s env TTS_VOICE="$verify_voice" TTS_RATE=1.0 TTS_SILENT=1 \
+      TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
+      TTS_METRICS_FILE="$CLOUD_DIR/$name.json" TTS_INPUT_CHARS=5 \
+      bash -c 'exec "$0"' "$bin" <<< "Test." >/dev/null 2>"$error_file" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    rm -f "$error_file"
+    [[ -z "$fingerprint" ]] || health_set "$name" ok "" "$fingerprint"
+    return 0
+  fi
+  if [[ -s "$error_file" ]]; then
+    printf '%s: ' "$name" >&2
+    tail -c 800 "$error_file" >&2
+    [[ "$(tail -c 1 "$error_file")" == $'\n' ]] || printf '\n' >&2
+  elif [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    printf '%s: verification timed out\n' "$name" >&2
+  else
+    printf '%s: verification failed (exit %s)\n' "$name" "$rc" >&2
+  fi
+  rm -f "$error_file"
+  # A valid paid provider can be temporarily unavailable without becoming a
+  # broken installation. Keep its last proven health for quota/rate outages.
+  [[ $rc -eq 69 || $rc -eq 74 || $rc -eq 75 ]] && return 1
+  [[ -z "$fingerprint" ]] || health_set "$name" failed "exit $rc" "$fingerprint"
+  return 1
+}
+
+# One JSON blob so the settings panel makes a single call instead of a dozen.
+# Account-specific voice lists are cached, but --info is deliberately local:
+# opening the panel must never block on a vendor, consume rate capacity, or
+# disclose that it was opened. Refresh is an explicit action instead.
+cached_remote_voices() { # cached_remote_voices <name>
+  local name="$1"
+  local cache="$CACHE_DIR/voices/$name.json"
+  if [[ ! -L "$cache" && -s "$cache" && "$(stat -c%s "$cache" 2>/dev/null || printf 2097153)" -le 2097152 ]] && jq -e '
+      type == "array" and length <= 10000 and all(.[];
+        (.value|type)=="string" and (.value|length)>0 and (.value|length)<=256
+        and (.value|test("^[A-Za-z0-9._+-]+$"))
+        and (.label|type)=="string" and (.label|length)>0 and (.label|length)<=256
+        and ((.label|test("[[:cntrl:]]"))|not)
+        and (.language == null or ((.language|type)=="string" and (.language|length)<=64))
+        and (.gender == null or ((.gender|type)=="string" and (.gender|length)<=64))
+        and (.family == null or ((.family|type)=="string" and (.family|length)<=128)))
+    ' "$cache" >/dev/null 2>&1; then cat "$cache"; return 0; fi
+  printf '[]'
+}
+
+voice_for_provider() { # voice_for_provider <name>
+  [[ "$1" == teratts ]] || return 2
+  local voice
+  voice="$(cfg .teratts.voice "")"
+  [[ -n "$voice" ]] || voice="$(cached_remote_voices teratts | jq -r '(map(select(.value == "ru_f1"))[0].value // .[0].value // empty)')"
+  printf '%s' "${voice:-ru_f1}"
+}
+
+provider_voice_options() { # provider_voice_options <name>
+  local name="$1" bin out
+  bin="$(provider_path "$name")" || { printf '[]'; return; }
+  out="$(capture_command_bounded "$METADATA_MAX_BYTES" env \
+    TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
+    timeout --kill-after=1s 5s "$bin" --voices 2>/dev/null)" || { printf '[]'; return; }
+  jq -c 'if type == "array" then . else [] end' <<< "$out" 2>/dev/null || printf '[]'
+}
+
+refresh_remote_voices() { # refresh_remote_voices <name>
+  local name="$1" bin out cache tmp
+  bin="$(provider_path "$name")" || return 2
+  [[ "$(meta_of "$bin" kind)" == cloud ]] || return 2
+  out="$(capture_command_bounded "$METADATA_MAX_BYTES" env \
+         TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
+         timeout --kill-after=2s 30s "$bin" --voices)" || return $?
+  jq -e 'type == "array" and length <= 10000 and all(.[];
+      (.value|type)=="string" and (.value|length)>0 and (.value|length)<=256
+      and (.value|test("^[A-Za-z0-9._+-]+$"))
+      and (.label|type)=="string" and (.label|length)>0 and (.label|length)<=256
+      and (.language == null or ((.language|type)=="string" and (.language|length)<=64))
+      and (.gender == null or ((.gender|type)=="string" and (.gender|length)<=64))
+      and (.family == null or ((.family|type)=="string" and (.family|length)<=128)))' \
+    <<< "$out" >/dev/null 2>&1 || return 1
+  cache="$CACHE_DIR/voices/$name.json"
+  mkdir -p "$(dirname "$cache")" || return 1
+  chmod 700 "$(dirname "$cache")" || return 1
+  tmp="$(mktemp "${cache}.XXXXXX")" || return 1
+  if jq -c '
+      def clean: gsub("[[:cntrl:]]"; " ");
+      map({value, label:(.label | clean)}
+          + (if (.language|type)=="string" then {language:(.language | clean)} else {} end)
+          + (if (.gender|type)=="string" then {gender:(.gender | clean)} else {} end)
+          + (if (.family|type)=="string" then {family:(.family | clean)} else {} end))
+      | unique_by(.value) | sort_by(.label | ascii_downcase)' <<< "$out" > "$tmp"; then
+    if ! chmod 600 "$tmp" || ! mv -T -- "$tmp" "$cache"; then rm -f "$tmp"; return 1; fi
+  else
+    rm -f "$tmp"; return 1
+  fi
+  if [[ "$name" == teratts && -z "$(cfg .teratts.voice "")" ]]; then
+    local first_voice
+    first_voice="$(jq -r '(map(select(.value == "ru_f1"))[0].value // .[0].value // empty)' "$cache")"
+    [[ -n "$first_voice" ]] && { tts_config_set .teratts.voice "$first_voice" || true; }
+  fi
+  # Return a confirmation, not the account-specific names. The cache is read
+  # privately by --info and the panel reload that follows this command.
+  jq -nc --arg provider "$name" --argjson count "$(jq length "$cache")" \
+    '{provider:$provider,count:$count}'
+}
+
+# Recognition languages the active OCR engine offers. Cached like cloud voice
+# lists: building it reads the package database, and opening the panel should
+# not pay for that.
+ocr_languages() { # ocr_languages <engine>
+  local cache="$CACHE_DIR/ocr/$1.json"
+  if [[ ! -L "$cache" && -s "$cache" && "$(stat -c%s "$cache" 2>/dev/null || printf 1048577)" -le 1048576 ]] && jq -e '
+      type == "array" and length <= 1000 and all(.[];
+        (.value|type)=="string" and (.value|length)>0 and (.value|length)<=64
+        and (.value|test("^[A-Za-z0-9_+.-]+$"))
+        and (.label|type)=="string" and (.label|length)>0 and (.label|length)<=256
+        and (.installed|type)=="boolean")
+    ' "$cache" >/dev/null 2>&1; then cat "$cache"; return 0; fi
+  printf '[]'
+}
+
+refresh_ocr_languages() { # refresh_ocr_languages <engine>
+  local engine="$1" bin out cache tmp
+  bin="$(ocr_engine_path "$engine")" || return 2
+  out="$(capture_command_bounded 1048576 env \
+         TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
+         timeout --kill-after=2s 60s "$bin" --languages 2>/dev/null)" || return 1
+  jq -e 'type == "array" and length <= 1000 and all(.[];
+      (.value|type)=="string" and (.value|length)>0 and (.value|length)<=64
+      and (.value|test("^[A-Za-z0-9_+.-]+$"))
+      and (.label|type)=="string" and (.label|length)>0 and (.label|length)<=256
+      and (.installed|type)=="boolean")' <<< "$out" >/dev/null 2>&1 || return 1
+  cache="$CACHE_DIR/ocr/$engine.json"
+  mkdir -p "$(dirname "$cache")" || return 1
+  chmod 700 "$(dirname "$cache")" || return 1
+  tmp="$(mktemp "${cache}.XXXXXX")" || return 1
+  if printf '%s' "$out" > "$tmp" && chmod 600 "$tmp" && mv -T -- "$tmp" "$cache"; then
+    jq -nc --argjson n "$(jq 'length' "$cache")" \
+           --argjson i "$(jq '[.[]|select(.installed)]|length' "$cache")" \
+           '{languages:$n, installed:$i}'
+    return 0
+  fi
+  rm -f "$tmp"; return 1
+}
+
+# OCR engines are listed, proven and selected exactly the way speech providers
+# are. Health is keyed "ocr:<name>" so an engine and a voice provider that
+# happen to share a name never overwrite each other's record.
+ocr_engine_names() {
+  { ls -1 "$USER_DIR/ocr" 2>/dev/null; ls -1 "$PLUGIN_DIR/ocr" 2>/dev/null; } |
+    sort -u | while read -r n; do ocr_engine_path "$n" >/dev/null && printf '%s\n' "$n"; done
+}
+
+ocr_engine_status() { # engine executable, pre-read health, credential source
+  local bin="$1" health="$2" credential_source="${3:-none}" kind
+  kind="$(meta_of "$bin" kind)"
+  if [[ "$kind" == "cloud" ]]; then
+    [[ "$credential_source" != keyerror ]] || { printf 'keyerror'; return; }
+    [[ "$credential_source" != none ]] || { printf 'nokey'; return; }
+  elif ! provider_installed "$bin"; then
+    printf 'missing'; return
+  fi
+  case "$health" in
+    ok)     printf 'ready' ;;
+    failed) printf 'failing' ;;
+    *)      printf 'untested' ;;
+  esac
+}
+
+# Prove an engine by making it read a known image. The fixture ships with the
+# plugin so proof never depends on a screenshot or on ImageMagick.
+# 0 = proved, 1 = installed but cannot read, 2 = not installed to test
+verify_ocr_engine() { # verify_ocr_engine <name>
+  local name="$1" bin out fingerprint="" error_file rc=0
+  bin="$(ocr_engine_path "$name")" || return 2
+  provider_installed "$bin" || return 2
+  fingerprint="$(health_fingerprint "ocr:$name" "$bin" || true)"
+  error_file="$(mktemp "$STATE_DIR/.verify-ocr.XXXXXX")" || return 1
+  out="$(capture_command_bounded 1048576 timeout --kill-after=5s 120s \
+      env TTS_OCR_LANGS=eng TTS_OCR_MINCONF=0 \
+      TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
+      TTS_METRICS_FILE="$CLOUD_DIR/ocr-$name.json" \
+      "$bin" < "$PLUGIN_DIR/lib/ocr-probe.png" 2>"$error_file")" || rc=$?
+  if [[ $rc -eq 0 ]] && grep -qiE 'probe|123' <<< "$out"; then
+    rm -f "$error_file"
+    [[ -z "$fingerprint" ]] || health_set "ocr:$name" ok "" "$fingerprint"
+    return 0
+  fi
+  if [[ -s "$error_file" ]]; then
+    printf '%s OCR: ' "$name" >&2
+    tail -c 800 "$error_file" >&2
+    [[ "$(tail -c 1 "$error_file")" == $'\n' ]] || printf '\n' >&2
+  elif [[ $rc -eq 0 ]]; then
+    printf '%s OCR: probe text was not recognized\n' "$name" >&2
+  elif [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    printf '%s OCR: verification timed out\n' "$name" >&2
+  else
+    printf '%s OCR: verification failed (exit %s)\n' "$name" "$rc" >&2
+  fi
+  rm -f "$error_file"
+  [[ $rc -eq 69 || $rc -eq 74 || $rc -eq 75 ]] && return 1   # transient cloud trouble
+  local note="exit $rc"
+  [[ $rc -ne 0 ]] || note="probe mismatch"
+  [[ -z "$fingerprint" ]] || health_set "ocr:$name" failed "$note" "$fingerprint"
+  return 1
+}
+
+# Real use is evidence for engines too. 78 is "language data missing" - a
+# configuration gap, not a broken engine - and cancellation never reaches here.
+record_ocr_outcome() { # record_ocr_outcome <engine> <rc> <text> <fingerprint>
+  local engine="$1" rc="$2" text="$3" fingerprint="${4:-}"
+  [[ -n "$fingerprint" ]] || return 0
+  if [[ $rc -eq 0 && -n "${text//[[:space:]]/}" ]]; then
+    health_set "ocr:$engine" ok "" "$fingerprint"
+  elif [[ $rc -ne 0 && $rc -ne 65 && $rc -ne 78 && $rc -ne 127 && $rc -ne 69 && $rc -ne 74 && $rc -ne 75 && $rc -ne 124 && $rc -ne 137 ]]; then
+    health_set "ocr:$engine" failed "exit $rc" "$fingerprint"
+  fi
+}
+
+emit_info() {
+  local config provs="[]" vs="[]" active voice voice_path
+  config="$(jq -c '.' "$CONFIG")" || return 1
+  provs="$(
+    provider_names | while read -r n; do
+      local b health status credential_source credential_identity credential_env
+      b="$(provider_path "$n")" || continue
+      IFS=$'\t' read -r credential_source credential_identity < <(key_state "$n" "$b")
+      credential_env="$(key_env_of "$n" "$b")"
+      health="$(health_of "$n" "$b" "$credential_source" "$credential_identity")"
+      status="$(provider_status "$b" "$health" "$credential_source")"
+      jq -nc --arg name "$n" \
+             --arg title "$(meta_of "$b" title)" \
+             --arg kind "$(meta_of "$b" kind)" \
+             --arg desc "$(meta_of "$b" desc)" \
+             --arg status "$status" \
+             --arg health "$health" \
+             --arg install "$(meta_of "$b" install)" \
+             --arg vendor "$(meta_of "$b" vendor)" \
+             --arg voices "$(meta_of "$b" voices)" \
+             --arg maxChars "$(meta_of "$b" maxchars)" \
+             --arg maxBytes "$(meta_of "$b" maxbytes)" \
+             --arg rateMin "$(meta_of "$b" ratemin)" \
+             --arg rateMax "$(meta_of "$b" ratemax)" \
+             --arg deprecated "$(meta_of "$b" deprecated)" \
+             --arg refreshVoices "$(meta_of "$b" refreshvoices)" \
+             --arg refreshUsage "$(meta_of "$b" refreshusage)" \
+             --arg keySource "$credential_source" \
+             --arg keyEnv "$credential_env" \
+             --argjson config "$config" \
+             --argjson usage "$(cloud_metrics_of "$n")" \
+             '{name:$name, title:(if $title=="" then $name else $title end), health:$health, kind:(if $kind=="" then "local" else $kind end),
+               desc:$desc, status:$status, install:$install, vendor:$vendor,
+               keySource:$keySource, keyEnv:(if $keyEnv=="" then null else $keyEnv end),
+               deprecated:($deprecated=="true"),
+               refreshVoices:($refreshVoices=="true"), refreshUsage:($refreshUsage=="true"),
+               model:(if $name=="openai" then ($config.openai.model // "gpt-4o-mini-tts")
+                      elif $name=="elevenlabs" then ($config.elevenlabs.model // "eleven_flash_v2_5")
+                      elif $name=="gemini" then ($config.gemini.model // "gemini-2.5-flash-preview-tts")
+                      elif $name=="google" then "Cloud Text-to-Speech"
+                      else null end), usage:$usage,
+               maxChars:(if $maxChars=="" then null else (try ($maxChars|tonumber) catch null) end),
+               maxBytes:(if $maxBytes=="" then null else (try ($maxBytes|tonumber) catch null) end),
+               rateMin:(if $rateMin=="" then null else (try ($rateMin|tonumber) catch null) end),
+               rateMax:(if $rateMax=="" then null else (try ($rateMax|tonumber) catch null) end),
+               voices:(if $voices=="" then "fixed" else $voices end)}'
+    done | jq -sc 'sort_by(.kind == "cloud", .status != "ready", .name)'
+  )"
+  local engines="[]"
+  engines="$(
+    ocr_engine_names | while read -r n; do
+      local b health status credential_source credential_identity credential_env
+      b="$(ocr_engine_path "$n")" || continue
+      IFS=$'\t' read -r credential_source credential_identity < <(key_state "$n" "$b")
+      credential_env="$(key_env_of "$n" "$b")"
+      health="$(health_of "ocr:$n" "$b" "$credential_source" "$credential_identity")"
+      status="$(ocr_engine_status "$b" "$health" "$credential_source")"
+      jq -nc --arg name "$n" \
+             --arg title "$(meta_of "$b" title)" \
+             --arg kind "$(meta_of "$b" kind)" \
+             --arg desc "$(meta_of "$b" desc)" \
+             --arg status "$status" \
+             --arg health "$health" \
+             --arg install "$(meta_of "$b" install)" \
+             --arg vendor "$(meta_of "$b" vendor)" \
+             --arg confidence "$(meta_of "$b" confidence)" \
+             --arg keySource "$credential_source" \
+             --arg keyEnv "$credential_env" \
+             --argjson usage "$(cloud_metrics_of "ocr-$n")" \
+             '{name:$name, title:(if $title=="" then $name else $title end), health:$health, kind:(if $kind=="" then "local" else $kind end),
+               desc:$desc, status:$status, install:$install, vendor:$vendor,
+               keySource:$keySource, keyEnv:(if $keyEnv=="" then null else $keyEnv end),
+               supportsConfidence:($confidence=="true"), usage:$usage}'
+    done | jq -sc 'sort_by(.kind == "cloud", .status != "ready", .name)'
+  )"
+  active=teratts
+  voice_path=.teratts.voice
+  vs="$(cached_remote_voices teratts)"
+  voice="$(voice_for_provider teratts)"
+  local speaking=false
+  is_speaking && speaking=true
+  # The voice list goes through a descriptor, not an argument: a cloud
+  # provider can list two thousand voices, which is past the single-argument
+  # limit and would make --info fail only for the accounts with the most.
+  jq -nc \
+    --argjson providers "$provs" \
+    --slurpfile voicesFile <(printf '%s\n' "$vs") \
+    --argjson config "$config" \
+    --arg voice "$voice" \
+    --arg voicePath "$voice_path" \
+    --argjson ocrLanguages "$(ocr_languages "$(jq -r '.ocr.engine // "tesseract"' <<< "$config")")" \
+    --argjson ocrEngines "$engines" \
+    --argjson speaking "$speaking" \
+    '{provider:"teratts", endpoint:($config.teratts.endpoint // ""), voice:$voice, voicePath:$voicePath,
+      rate:($config.rate // 1.0), maxChars:($config.maxChars // 0),
+      speaking:$speaking, providers:$providers, voices:$voicesFile[0],
+      ocr:{engine:($config.ocr.engine // "tesseract"),
+        model:(($config.ocr.engine // "tesseract") as $e
+               | if $e == "openai" then ($config.ocr.openai.model // "gpt-4.1-mini")
+                 elif $e == "google" then "DOCUMENT_TEXT_DETECTION" else null end),
+        langs:(($config.ocr.engine // "tesseract") as $e
+               | $config.ocr[$e].langs // (if $e == "tesseract" then $config.ocr.langs else null end) // "eng"),
+        minConfidence:($config.ocr.minConfidence // 60), languages:$ocrLanguages, engines:$ocrEngines,
+        remoteEndpoint:($config.ocr.remote.endpoint // "")},
+      sanitizer:{urls:($config.sanitizer.urls // "domain"),
+        inlineCode:($config.sanitizer.inlineCode // true),
+        announceCodeBlocks:($config.sanitizer.announceCodeBlocks // true),
+        stripMarkdown:($config.sanitizer.stripMarkdown // true),
+        expandUnits:($config.sanitizer.expandUnits // true)},
+      ui:{lastTab:($config.ui.lastTab // 0),
+        exportFormat:($config.ui.exportFormat // "mp3"),
+        sampleText:($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now."),
+        sampleIsDefault:(($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now.") == "Highlight any text and press the key. This is how it sounds right now.")}}'
+}
+
+set_config() { # validated path value; forget proof tied to the old setting
+  local path="$1" value="$2" health_key=""
+  tts_config_set "$path" "$value" || return
+  case "$path" in
+    .teratts.*) health_key=teratts ;;
+    .ocr.remote.*) health_key=ocr:remote ;;
+    .ocr.openai.model) health_key=ocr:openai ;;
+    .ocr.langs) health_key=ocr:tesseract ;;
+    .ocr.*.langs)
+      if [[ "$path" =~ ^\.ocr\.([A-Za-z0-9._-]+)\.langs$ ]]; then
+        health_key="ocr:${BASH_REMATCH[1]}"
+      fi ;;
+  esac
+  [[ -z "$health_key" ]] || tts_health_invalidate "$HEALTH" "$health_key" || true
+}
+
+stop_owned_group() { # owner-file
+  local owner_file="$1" owner="" pgid="" identity="" current_identity="" current_group=""
+  owner="$(small_runtime_value "$owner_file" 256 || true)"
+  read -r pgid identity <<< "$owner"
+  [[ "$pgid" =~ ^[0-9]+$ ]] &&
+    current_identity="$(process_identity "$pgid" || true)"
+  current_group="$(process_group "$pgid" || true)"
+  if [[ -n "$identity" && "$identity" == "$current_identity" &&
+        "$current_group" == "$pgid" ]] &&
+      kill -0 -- "-$pgid" 2>/dev/null; then
+    kill -TERM -- "-$pgid" 2>/dev/null
+    sleep 0.15
+    # The leader may have exited during the grace period. A new process group
+    # can reuse this numeric id only by creating a new leader with that PID, so
+    # kill stubborn members only when the original leader still matches or no
+    # leader exists at all. Never signal a newly reused PID/PGID.
+    current_identity="$(process_identity "$pgid" || true)"
+    if [[ -z "$current_identity" || "$current_identity" == "$identity" ]]; then
+      kill -KILL -- "-$pgid" 2>/dev/null
+    fi
+  fi
+  rm -f "$owner_file"
+}
+
+stop_speaking_unlocked() {
+  local job_id="" player_socket=""
+  job_id="$(jq -r '.jobId // empty' "$STATE_DIR/job.json" 2>/dev/null || true)"
+  stop_owned_group "$PID_FILE"
+  stop_owned_group "$PREP_FILE"
+  if [[ "$job_id" =~ ^[0-9a-f]{32}$ ]]; then
+    player_socket="$STATE_DIR/p-${job_id:0:12}.sock"
+    [[ ! -L "$player_socket" && -S "$player_socket" && -O "$player_socket" ]] && rm -f -- "$player_socket"
+  fi
+  rm -f "$ACTIVE_PROVIDER_FILE"
+  rm -f "$STATE_DIR/job.json" "$STATE_DIR/player.json"
+  set_status idle
+}
+
+stop_speaking() {
+  local lock_fd
+  exec {lock_fd}>>"$SPEECH_LOCK"
+  flock "$lock_fd"
+  stop_speaking_unlocked
+  flock -u "$lock_fd"
+  exec {lock_fd}>&-
+}
+
+owner_is_live() { # owner-file
+  local owner_file="$1" owner="" pgid="" identity="" current_identity="" current_group=""
+  owner="$(small_runtime_value "$owner_file" 256 || true)"
+  read -r pgid identity <<< "$owner"
+  [[ "$pgid" =~ ^[0-9]+$ ]] || return 1
+  current_identity="$(process_identity "$pgid" || true)"
+  current_group="$(process_group "$pgid" || true)"
+  [[ -n "$identity" && "$identity" == "$current_identity" &&
+     "$current_group" == "$pgid" ]] &&
+    kill -0 -- "-$pgid" 2>/dev/null
+}
+
+is_speaking() {
+  owner_is_live "$PID_FILE" || owner_is_live "$PREP_FILE"
+}
+
+PREP_OWNER=""
+PLAYBACK_OWNER=""
+declare -a JOB_TEMP_FILES=()
+# Invoked through the EXIT trap installed by register_preparation.
+# ShellCheck 0.10 uses SC2317 for trap-only functions; 0.11 uses SC2329.
+# shellcheck disable=SC2317,SC2329
+cleanup_preparation() { # exit-code; cancellation and replacement are not failures
+  [[ -n "$PREP_OWNER" ]] || return 0
+  local lock_fd current="" rc="${1:-0}" error_code=io failed=0 error_state=""
+  exec {lock_fd}>>"$SPEECH_LOCK" || return 0
+  flock -w 2 "$lock_fd" || { exec {lock_fd}>&-; return 0; }
+  current="$(small_runtime_value "$PREP_FILE" 256 || true)"
+  if [[ "$current" == "$PREP_OWNER" ]]; then
+    if [[ $rc -ne 0 && $rc -ne 130 && $rc -ne 137 && $rc -ne 143 ]]; then
+      case "$rc" in
+        65) error_code=invalid_input ;;
+        69) error_code=quota ;;
+        74|124) error_code=network ;;
+        75) error_code=rate_limited ;;
+        77) error_code=unauthorized ;;
+      esac
+      # The preparation owner still matches under speech.lock. Publish only
+      # fixed metadata, never OCR stderr, selected text or captured images.
+      error_state="$(jq -nc --arg id "$JOB_ID" --arg code "$error_code" \
+        '{jobId:$id,status:"error",phase:null,errorCode:$code}')"
+      atomic_state_write "$STATE_DIR/player.json" "$error_state" || true
+      failed=1
+    fi
+    rm -f "$PREP_FILE"
+    owner_is_live "$PID_FILE" || set_status idle
+  fi
+  flock -u "$lock_fd"
+  exec {lock_fd}>&-
+  [[ $failed -eq 0 ]] || notify intake
+}
+
+# Invoked through the EXIT trap installed by register_preparation.
+# ShellCheck 0.10 uses SC2317 for trap-only functions; 0.11 uses SC2329.
+# shellcheck disable=SC2317,SC2329
+cleanup_job() {
+  local exit_code=$?
+  # Stop holds the speech lock while it signals us. Delete private captures
+  # before trying to reacquire that lock so its short escalation deadline can
+  # never leave screenshot or OCR text files behind.
+  [[ ${#JOB_TEMP_FILES[@]} -eq 0 ]] || rm -f -- "${JOB_TEMP_FILES[@]}"
+  JOB_TEMP_FILES=()
+  cleanup_preparation "$exit_code"
+  if [[ -n "$PLAYBACK_OWNER" ]]; then
+    local lock_fd current=""
+    exec {lock_fd}>>"$SPEECH_LOCK" || true
+    if [[ -n "${lock_fd:-}" ]] && flock -w 2 "$lock_fd"; then
+      current="$(small_runtime_value "$PID_FILE" 256 || true)"
+      if [[ "$current" == "$PLAYBACK_OWNER" ]]; then
+        stop_owned_group "$PID_FILE"
+        rm -f "$ACTIVE_PROVIDER_FILE"
+        set_status idle
+      fi
+      flock -u "$lock_fd"
+      exec {lock_fd}>&-
+    fi
+  fi
+}
+
+capture_command_bounded() ( # maximum-bytes command [args...] -> bounded stdout
+  local maximum="$1" output command_rc=0 head_rc=0 size
+  local -a pipe_status
+  shift
+  output="$(mktemp "$STATE_DIR/.bounded-output.XXXXXX")" || return 1
+  trap 'rm -f "$output"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  "$@" | head -c "$((maximum + 1))" > "$output"
+  pipe_status=("${PIPESTATUS[@]}")
+  command_rc=${pipe_status[0]}
+  head_rc=${pipe_status[1]}
+  [[ $head_rc -eq 0 ]] || return "$head_rc"
+  size="$(stat -c%s "$output" 2>/dev/null || printf 0)"
+  [[ "$size" -le "$maximum" ]] || return 65
+  [[ $command_rc -eq 0 ]] || return "$command_rc"
+  cat "$output"
+)
+
+run_ocr_bounded() ( # engine image -> bounded recognized text
+  local engine="$1" image="$2" output rc=0
+  python3 "$PLUGIN_DIR/lib/audio_control.py" --phase ocr >/dev/null || true
+  output="$(mktemp "$STATE_DIR/.ocr-output.XXXXXX")" || return 1
+  trap 'rm -f "$output"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  timeout --kill-after=2s 120s "$engine" < "$image" | head -c "$((INPUT_MAX_BYTES + 1))" > "$output"
+  rc=${PIPESTATUS[0]}
+  if [[ "$(stat -c%s "$output" 2>/dev/null || printf 0)" -gt "$INPUT_MAX_BYTES" ]]; then
+    printf 'speak: OCR output exceeded the 1 MiB safety limit\n' >&2
+    return 65
+  fi
+  cat "$output"
+  return "$rc"
+)
+
+register_preparation() {
+  local lock_fd identity
+  identity="$(process_identity "$$")" || return 1
+  [[ "$(process_group "$$" || true)" == "$$" ]] || return 1
+  PREP_OWNER="$$ $identity"
+  exec {lock_fd}>>"$SPEECH_LOCK" || return 1
+  flock "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+  current_kind="$(jq -r '.kind // ""' "$STATE_DIR/job.json" 2>/dev/null || true)"
+  if is_speaking && [[ "$current_kind" == export || "$JOB_KIND" == export ]]; then
+    flock -u "$lock_fd"; exec {lock_fd}>&-
+    printf '{"errorCode":"busy"}\n' >&2
+    return 75
+  fi
+  stop_speaking_unlocked
+  JOB_ID="$(python3 -c 'import secrets; print(secrets.token_hex(16))')" || return 1
+  export TTS_JOB_ID="$JOB_ID" TTS_JOB_KIND="$JOB_KIND"
+  job_json="$(jq -nc --arg id "$JOB_ID" --arg kind "$JOB_KIND" --arg audioId "${TTS_AUDIO_ID:-}" \
+    '{jobId:$id,kind:$kind,pauseRequested:false,audioId:$audioId}')"
+  atomic_state_write "$STATE_DIR/job.json" "$job_json" || return 1
+  if ! atomic_state_write "$PREP_FILE" "$PREP_OWNER" || ! set_status preparing; then
+    rm -f "$PREP_FILE"
+    PREP_OWNER=""
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return 1
+  fi
+  flock -u "$lock_fd"
+  exec {lock_fd}>&-
+  trap cleanup_job EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: speak [options] [text...]
+
+Input (default: stdin)
+  -s, --selection      speak the highlighted text (primary selection)
+  -c, --clipboard      speak clipboard text or OCR a copied image
+      --raw            skip the sanitizer, speak text verbatim
+
+Read the screen (OCR)
+      --snip           drag a region and speak the text in it
+      --window         speak the focused window (no pointer needed)
+      --screen         speak the focused monitor (no pointer needed)
+      --ocr-engine N   override the OCR engine
+
+Control
+  -S, --stop           stop speech in progress
+  -T, --toggle         stop if speaking, otherwise speak the selection
+      --status         print current status and exit
+      --watch-status   stream status changes (used by the bar widget)
+      --watch-state    stream playback state and heartbeat as JSON (used by the bar widget)
+      --pause, --resume, --pause-toggle  control current playback
+      --quick-action   pause/resume, or read the selection when idle
+      --playback-rate N change current speed without saving a default
+      --playback-seek N seek to seconds in the current file preview
+      --export-wav     save the chosen source as WAV (default: selection)
+      --export-audio   save audio in the chosen format (default: selection)
+      --format FORMAT mp3 (default), ogg (Opus), or wav; used with --export-audio
+      --audio-list, --show-audio  list audio files or open the audio panel
+      --audio-preview ID, --audio-copy ID, --audio-delete ID
+
+Voice
+  -p, --provider NAME  override the configured provider
+  -v, --voice NAME     override the configured voice
+  -r, --rate N         speed multiplier (provider-dependent)
+  -m, --max-chars N    truncate near N characters (0 = unlimited)
+  -l, --list           list available providers
+      --verify [NAME]  prove a provider can actually speak (silent)
+      --verify-ocr [NAME] prove an OCR engine can read a known image
+      --refresh-voices [NAME] safely re-fetch cloud voice lists
+      --refresh-languages [ENGINE] re-read OCR language availability
+      --cycle-provider       switch to the next provider
+      --current-provider  print the active provider
+      --watch-provider    stream provider changes (used by the bar widget)
+      --info           print all state as JSON (used by the settings panel)
+      --usage NAME     refresh and print cloud account usage when supported
+      --set P V        write a config value, e.g. --set .rate 1.2
+      --set-stdin-json P read a JSON string from one stdin line and write P
+      --preview        sanitize stdin and print the exact text that would be spoken
+      --preview-text T sanitize one argument (legacy scripting form)
+      --preview-stdin-json sanitize a JSON string read from one stdin line
+  -h, --help           this text
+
+Config: ~/.config/omarchy-tts/config.json
+USAGE
+}
+
+read_json_line() { # maximum encoded characters
+  local maximum="$1" encoded=""
+  # `read` without a count allocates the complete line before we can inspect
+  # it. Stop after one character beyond the protocol ceiling instead.
+  IFS= read -r -n "$((maximum + 1))" encoded || [[ -n "$encoded" ]] || return 1
+  [[ ${#encoded} -le $maximum ]] || return 2
+  printf '%s' "$encoded" | jq -er '
+    if type == "string" and (index("\u0000") | not) then .
+    else error("expected a NUL-free string") end'
+}
+
+# Help is documentation, not a stateful operation. It must remain available
+# even when the session runtime or configuration directory is read-only.
+if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+  usage
+  exit 0
+fi
+
+[[ ! -L "$STATE_DIR" ]] || {
+  printf 'speak: unsafe runtime directory symlink: %s\n' "$STATE_DIR" >&2; exit 1;
+}
+mkdir -p "$STATE_DIR"
+[[ ! -L "$STATE_DIR" && "$(stat -c %u "$STATE_DIR" 2>/dev/null)" == "$UID" ]] || {
+  printf 'speak: unsafe runtime directory: %s\n' "$STATE_DIR" >&2; exit 1;
+}
+chmod 700 "$STATE_DIR" || exit 1
+
+case "${1:-}" in
+  --quick-action)
+    python3 "$PLUGIN_DIR/lib/audio_control.py" "$@"
+    control_rc=$?
+    [[ $control_rc -eq 3 ]] || exit "$control_rc"
+    set -- --selection ;;
+  --audio-delete)
+    [[ $# -eq 2 && "$2" =~ ^[0-9a-f]{32}$ ]] || { printf '{"errorCode":"invalid_input"}\n' >&2; exit 1; }
+    exec {delete_lock_fd}>>"$SPEECH_LOCK" || exit 1
+    flock "$delete_lock_fd" || exit 1
+    current_job="$(small_runtime_value "$STATE_DIR/job.json" 16384 || true)"
+    if jq -e --arg id "$2" '.kind == "preview" and .audioId == $id' >/dev/null 2>&1 <<< "$current_job"; then
+      stop_speaking_unlocked
+    fi
+    flock -u "$delete_lock_fd"
+    exec {delete_lock_fd}>&-
+    # The backend reacquires the job lock and refuses a newly started preview
+    # of this same file. Never stop a different replacement job.
+    exec python3 "$PLUGIN_DIR/lib/audio_control.py" "$@" ;;
+  --pause|--resume|--pause-toggle|--playback-rate|--playback-seek|--watch-state|--audio-list|--audio-copy|--audio-open-folder|--show-audio|--consume-ui-request)
+    exec python3 "$PLUGIN_DIR/lib/audio_control.py" "$@" ;;
+  --audio-preview)
+    [[ $# -eq 2 ]] || die "--audio-preview needs an ID"
+    python3 "$PLUGIN_DIR/lib/audio_control.py" --audio-path "$2" >/dev/null || exit $?
+    export TTS_AUDIO_ID="$2" TTS_JOB_KIND=preview
+    JOB_KIND=preview
+    set -- --raw "Audio preview" ;;
+esac
+
+# Control must remain available even when configuration is damaged or its
+# directory is temporarily read-only. Toggle is resolved here too, before a
+# new preparation owner could mistake itself for the work it should stop.
+if [[ $# -eq 1 ]]; then
+  case "$1" in
+    -S|--stop) stop_speaking; exit 0 ;;
+    --status)
+      if is_speaking; then
+        small_runtime_value "$STATUS_FILE" 64 && echo || echo preparing
+      else echo idle
+      fi
+      exit 0 ;;
+    --watch-status)
+      last=""
+      while :; do
+        cur="$(small_runtime_value "$STATUS_FILE" 64 || echo idle)"
+        is_speaking || cur=idle
+        [[ "$cur" != "$last" ]] && { printf '%s\n' "$cur"; last="$cur"; }
+        sleep 0.4
+      done ;;
+    -T|--toggle)
+      if is_speaking; then stop_speaking; exit 0; fi
+      set -- --selection ;;
+  esac
+fi
+
+# Speech-like invocations get their own session before any configuration,
+# capture, OCR, or sanitization work. Stop can then cancel the entire process
+# group—including slurp, a frozen-screen helper, or a cloud OCR request.
+speech_request=1
+[[ $# -eq 0 && -t 0 ]] && speech_request=0
+scan_args=("$@")
+for ((scan_i=0; scan_i<${#scan_args[@]}; scan_i++)); do
+  scan_arg="${scan_args[$scan_i]}"
+  case "$scan_arg" in
+    --) break ;;
+    -p|--provider|-v|--voice|-r|--rate|-m|--max-chars|--ocr-engine|--format)
+      ((scan_i++)) || true ;;
+    --export-wav|--export-audio) JOB_KIND=export ;;
+    -s|--selection|-c|--clipboard|--snip|--window|--screen|--raw|--stdin-json|-T|--toggle) ;;
+    -S|--stop|--status|--watch-status|--watch-state|-l|--list|-h|--help|\
+    --verify|--verify-ocr|--refresh-voices|--refresh-languages|--cycle-provider|\
+    --current-provider|--watch-provider|--info|--usage|--set|--set-stdin-json|\
+    --preview|--preview-text|--preview-stdin-json)
+      speech_request=0; break ;;
+    -*) speech_request=0; break ;;
+  esac
+done
+if [[ $speech_request -eq 1 ]]; then
+  if [[ "${TTS_PREPARATION_SESSION:-0}" != 1 ]]; then
+    command -v setsid >/dev/null 2>&1 || die "setsid is required to own cancellable speech work"
+    exec setsid --wait env TTS_PREPARATION_SESSION=1 "$0" "$@"
+  fi
+  register_preparation
+  prep_rc=$?
+  [[ $prep_rc -eq 0 ]] || exit "$prep_rc"
+fi
+
+tts_config_init || { printf 'speak: could not initialize %s\n' "$CONFIG" >&2; exit 1; }
+if [[ "$JOB_KIND" == export && $speech_request -eq 1 ]]; then
+  frozen_config="$(mktemp "$STATE_DIR/.export-config.XXXXXX")" || exit 1
+  JOB_TEMP_FILES+=("$frozen_config")
+  head -c "$((METADATA_MAX_BYTES + 1))" "$CONFIG" > "$frozen_config" || exit 1
+  [[ "$(stat -c%s "$frozen_config")" -le "$METADATA_MAX_BYTES" ]] || exit 1
+  CONFIG="$frozen_config"
+fi
+
+OCRMODE=0
+SOURCE=stdin PROVIDER="" VOICE="" RATE="" MAXCHARS="" RAWMODE=0 OCR_ENGINE=""
+EXPORT_FORMAT="" LEGACY_WAV=0
+[[ "$JOB_KIND" == export ]] && SOURCE=selection
+declare -a WORDS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --export-wav) LEGACY_WAV=1 ;;
+    --export-audio) ;;
+    --format)
+      [[ $# -ge 2 ]] || die "--format needs a value"
+      [[ "$2" == mp3 || "$2" == ogg || "$2" == wav ]] || die "--format must be mp3, ogg, or wav"
+      EXPORT_FORMAT="$2"; shift ;;
+    -s|--selection) SOURCE=selection ;;
+    -c|--clipboard) SOURCE=clipboard ;;
+    --stdin-json) SOURCE=jsonline ;;
+    --snip) SOURCE=snip ;;
+    --window) SOURCE=window ;;
+    --screen) SOURCE=screen ;;
+    --ocr-engine) [[ $# -ge 2 ]] || die "--ocr-engine needs a value"; OCR_ENGINE="$2"; shift ;;
+    --raw) RAWMODE=1 ;;
+    -S|--stop) stop_speaking; exit 0 ;;
+    -T|--toggle) SOURCE=selection ;;
+    --status)
+      if is_speaking; then
+        small_runtime_value "$STATUS_FILE" 64 && echo || echo speaking
+      else echo idle
+      fi
+      exit 0 ;;
+    --watch-status)
+      last=""
+      while :; do
+        cur="$(small_runtime_value "$STATUS_FILE" 64 || echo idle)"
+        is_speaking || cur=idle
+        [[ "$cur" != "$last" ]] && { printf '%s\n' "$cur"; last="$cur"; }
+        sleep 0.4
+      done ;;
+    -p|--provider) [[ $# -ge 2 ]] || die "--provider needs a value"; PROVIDER="$2"; shift ;;
+    -v|--voice) [[ $# -ge 2 ]] || die "--voice needs a value"; VOICE="$2"; shift ;;
+    -r|--rate) [[ $# -ge 2 ]] || die "--rate needs a value"; RATE="$2"; shift ;;
+    -m|--max-chars) [[ $# -ge 2 ]] || die "--max-chars needs a value"; MAXCHARS="$2"; shift ;;
+    --current-provider) cfg .provider teratts; echo; exit 0 ;;
+    --watch-provider)
+      last="" stamp=""
+      while :; do
+        current_stamp="$(stat -c '%y:%s' "$CONFIG" 2>/dev/null || true)"
+        if [[ "$current_stamp" != "$stamp" ]]; then
+          cur="$(cfg .provider teratts)"
+          [[ "$cur" != "$last" ]] && { printf '%s\n' "$cur"; last="$cur"; }
+          stamp="$current_stamp"
+        fi
+        sleep 0.5
+      done ;;
+    --cycle-provider)
+      new="$(cycle_provider)" || die "no providers available"
+      notify provider
+      printf '%s\n' "$new"; exit 0 ;;
+    --info) emit_info; exit 0 ;;
+    --usage)
+      usage_name="${2:-$(cfg .provider teratts)}"
+      [[ "$usage_name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid provider name"
+      usage_bin="$(provider_path "$usage_name")" || die "no such provider: $usage_name"
+      [[ "$(meta_of "$usage_bin" kind)" == cloud ]] || die "$usage_name is not a cloud provider"
+      export TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR"
+      export TTS_METRICS_FILE="$CLOUD_DIR/$usage_name.json"
+      "$usage_bin" --usage; exit $? ;;
+    --set)
+      [[ -n "${2:-}" && -n "${3:-}" ]] || die "--set needs a path and a value"
+      set_config "$2" "$3" || die "could not write $2"
+      [[ "$2" == ".provider" ]] && stop_speaking
+      shift 2; exit 0 ;;
+    --set-stdin-json)
+      [[ -n "${2:-}" ]] || die "--set-stdin-json needs a path"
+      stdin_value="$(read_json_line 262144)" || die "could not read a bounded JSON string"
+      set_config "$2" "$stdin_value" || die "could not write $2"
+      [[ "$2" == ".provider" ]] && stop_speaking
+      shift; exit 0 ;;
+    --preview)
+      SAN_ARGS=(--config "$CONFIG")
+      python3 "$SANITIZER" "${SAN_ARGS[@]}"; exit $? ;;
+    --preview-text)
+      [[ -n "${2:-}" ]] || die "--preview-text needs text"
+      printf '%s' "$2" | python3 "$SANITIZER" --config "$CONFIG"; exit $? ;;
+    --preview-stdin-json)
+      preview_value="$(read_json_line 262144)" || die "could not read a bounded JSON string"
+      printf '%s' "$preview_value" | python3 "$SANITIZER" --config "$CONFIG"; exit $? ;;
+    --verify)
+      vtargets="${2:-}"
+      [[ -n "$vtargets" ]] && shift || vtargets="$(provider_names)"
+      vrc=0
+      for vn in $vtargets; do
+        printf '%-14s ' "$vn"
+        verify_provider "$vn"; case $? in
+          0) echo "ok" ;;
+          2) echo "not installed" ;;
+          *) echo "FAILING"; vrc=1 ;;
+        esac
+      done
+      exit $vrc ;;
+    --verify-ocr)
+      otargets="${2:-}"
+      [[ -n "$otargets" ]] && shift || otargets="$(ocr_engine_names)"
+      orc=0
+      for on in $otargets; do
+        printf '%-14s ' "$on"
+        verify_ocr_engine "$on"; case $? in
+          0) echo "ok" ;;
+          2) echo "not installed" ;;
+          *) echo "FAILING"; orc=1 ;;
+        esac
+      done
+      exit $orc ;;
+    --refresh-languages)
+      lang_engine="${2:-$(cfg .ocr.engine tesseract)}"
+      [[ "$lang_engine" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid OCR engine name"
+      refresh_ocr_languages "$lang_engine" || die "could not list languages for $lang_engine"
+      exit 0 ;;
+    --refresh-voices)
+      voice_target="${2:-$(cfg .provider teratts)}"
+      [[ "$voice_target" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid provider name"
+      refresh_remote_voices "$voice_target" || die "could not refresh voices for $voice_target"
+      exit 0 ;;
+    -l|--list) list_providers; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; WORDS+=("$@"); break ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *) WORDS+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ "$JOB_KIND" == export ]]; then
+  if [[ $LEGACY_WAV -eq 1 ]]; then
+    [[ -z "$EXPORT_FORMAT" || "$EXPORT_FORMAT" == wav ]] || die "--export-wav conflicts with --format"
+    EXPORT_FORMAT=wav
+  else
+    EXPORT_FORMAT="${EXPORT_FORMAT:-$(cfg .ui.exportFormat mp3)}"
+  fi
+  export TTS_EXPORT_FORMAT="$EXPORT_FORMAT"
+else
+  [[ -z "$EXPORT_FORMAT" ]] || die "--format requires --export-audio"
+fi
+
+[[ -z "$RATE" || "$RATE" =~ ^(0?[.][0-9]+|[1-3]([.][0-9]+)?|4([.]0+)?)$ ]] ||
+  die "rate must be a decimal between 0.25 and 4.0"
+[[ -z "$RATE" ]] || awk -v value="$RATE" 'BEGIN { exit !(value >= 0.25 && value <= 4.0) }' ||
+  die "rate must be between 0.25 and 4.0"
+[[ -z "$MAXCHARS" || "$MAXCHARS" =~ ^[0-9]+$ ]] || die "max-chars must be a non-negative integer"
+if [[ -n "$MAXCHARS" ]] &&
+    { [[ ${#MAXCHARS} -gt 7 ]] ||
+      ! awk -v value="$MAXCHARS" -v maximum="$INPUT_MAX_BYTES" \
+        'BEGIN { exit !(value <= maximum) }'; }; then
+  die "max-chars must not exceed $INPUT_MAX_BYTES"
+fi
+[[ -z "$PROVIDER" || "$PROVIDER" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid provider name"
+[[ -z "$VOICE" || "$VOICE" =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid voice name"
+[[ -z "$OCR_ENGINE" || "$OCR_ENGINE" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid OCR engine name"
+
+# OCR engines share the same environment regardless of their input source.
+export TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR"
+
+# --- gather input ---------------------------------------------------------
+if [[ ${#WORDS[@]} -gt 0 ]]; then
+  TEXT="${WORDS[*]}"
+else
+  case "$SOURCE" in
+    selection)
+      capture_rc=0
+      TEXT="$(capture_command_bounded "$INPUT_MAX_BYTES" \
+        wl-paste --primary --no-newline 2>/dev/null)" || capture_rc=$?
+      [[ $capture_rc -ne 65 ]] || die "selection is larger than the 1 MiB safety limit"
+      [[ $capture_rc -eq 0 ]] || die "could not read the current selection"
+      ;;
+    clipboard)
+      clipboard_types="$(wl-paste --list-types 2>/dev/null || true)"
+      text_mime="$(awk '/^text\/plain(;.*)?$|^UTF8_STRING$|^text\/uri-list$/ { print; exit }' \
+        <<< "$clipboard_types")"
+      # Prefer actual text when the source supplies both representations. If
+      # it is image-only, route it through the same private OCR pipeline as a
+      # screen capture instead of feeding binary data to a speech provider.
+      if [[ -n "$text_mime" ]]; then
+        capture_rc=0
+        TEXT="$(capture_command_bounded "$INPUT_MAX_BYTES" \
+          wl-paste --type "$text_mime" --no-newline 2>/dev/null)" || capture_rc=$?
+        [[ $capture_rc -ne 65 ]] || die "clipboard text is larger than the 1 MiB safety limit"
+        [[ $capture_rc -eq 0 ]] || die "could not read clipboard text"
+      elif [[ -z "$clipboard_types" ]]; then
+        # If type discovery is unavailable, request text explicitly. Pasting
+        # the default representation could otherwise feed an image or another
+        # binary clipboard format into a cloud speech provider as text.
+        capture_rc=0
+        TEXT="$(capture_command_bounded "$INPUT_MAX_BYTES" \
+          wl-paste --type text/plain --no-newline 2>/dev/null)" || capture_rc=$?
+        [[ $capture_rc -ne 65 ]] || die "clipboard text is larger than the 1 MiB safety limit"
+        [[ $capture_rc -eq 0 ]] || die "could not inspect clipboard contents"
+      else
+        OCR_ENGINE="${OCR_ENGINE:-$(cfg .ocr.engine tesseract)}"
+        if [[ "$OCR_ENGINE" == remote ]]; then
+          # The dedicated endpoint accepts PNG/JPEG, even when the clipboard
+          # advertises WebP before those formats.
+          image_mime="$(awk '/^image\/png$/ { png=1 } /^image\/jpeg$/ { jpg=1 }
+            END { if (png) print "image/png"; else if (jpg) print "image/jpeg" }' \
+            <<< "$clipboard_types")"
+          [[ -n "$image_mime" ]] || die "OCR server needs a PNG or JPEG clipboard image"
+        elif [[ "$OCR_ENGINE" == openai ]]; then
+          image_mime="$(awk '/^image\/(png|jpeg|webp)$/ { print; exit }' <<< "$clipboard_types")"
+        else
+          image_mime="$(awk '/^image\/(png|jpeg|webp|bmp|tiff)$/ { print; exit }' \
+            <<< "$clipboard_types")"
+        fi
+        if [[ -z "$image_mime" ]]; then
+          die "clipboard contains no supported text or image"
+        else
+          OCR_BIN="$(ocr_engine_path "$OCR_ENGINE")" ||
+            die "no such OCR engine: $OCR_ENGINE"
+          export TTS_METRICS_FILE="$CLOUD_DIR/ocr-$OCR_ENGINE.json"
+          export TTS_OCR_IMAGE_MIME="$image_mime"
+          ocr_fingerprint="$(health_fingerprint "ocr:$OCR_ENGINE" "$OCR_BIN" || true)"
+          PNG="$(mktemp -t speak-clipboard-XXXXXX.img)" ||
+            die "could not create temporary clipboard image"
+          JOB_TEMP_FILES+=("$PNG")
+          capture clipboard-image "$image_mime" |
+            head -c "$((CAPTURE_MAX_BYTES + 1))" > "$PNG"
+          capture_rc=${PIPESTATUS[0]}
+          [[ "$(stat -c%s "$PNG" 2>/dev/null || printf 0)" -le "$CAPTURE_MAX_BYTES" ]] ||
+            die "clipboard image is larger than the 50 MiB safety limit"
+          [[ $capture_rc -eq 0 ]] || die "could not read the clipboard image"
+          [[ -s "$PNG" ]] || die "clipboard image is empty"
+          ocr_rc=0; TEXT="$(run_ocr_bounded "$OCR_BIN" "$PNG")" || ocr_rc=$?
+          record_ocr_outcome "$OCR_ENGINE" "$ocr_rc" "$TEXT" "$ocr_fingerprint"
+          # The engine has already said why it refused; do not relabel its
+          # reason as "no text found".
+          [[ $ocr_rc -ne 0 ]] && exit $ocr_rc
+          OCRMODE=1
+          if [[ -z "${TEXT//[[:space:]]/}" ]]; then
+            notify noImageText
+            exit 0
+          fi
+        fi
+      fi
+      ;;
+    stdin)     [[ -t 0 ]] && { usage; exit 1; }; TEXT="$(head -c "$((INPUT_MAX_BYTES + 1))")" ;;
+    jsonline)  TEXT="$(read_json_line 262144)" || die "could not read a bounded JSON string" ;;
+    snip|window|screen)
+      OCR_ENGINE="${OCR_ENGINE:-$(cfg .ocr.engine tesseract)}"
+      OCR_BIN="$(ocr_engine_path "$OCR_ENGINE")" ||
+        die "no such OCR engine: $OCR_ENGINE"
+      export TTS_METRICS_FILE="$CLOUD_DIR/ocr-$OCR_ENGINE.json"
+      export TTS_OCR_IMAGE_MIME=image/png
+      ocr_fingerprint="$(health_fingerprint "ocr:$OCR_ENGINE" "$OCR_BIN" || true)"
+      PNG="$(mktemp -t speak-XXXXXX.png)" || die "could not create temporary capture"
+      JOB_TEMP_FILES+=("$PNG")
+      # The panel closes first; keep its settling delay inside this owned job
+      # so Stop also cancels the interval before capture starts.
+      capture_delay="${TTS_CAPTURE_DELAY:-0}"
+      [[ "$capture_delay" == 0 || "$capture_delay" =~ ^0[.][0-9]{1,3}$ || "$capture_delay" == 1 ]] ||
+        die "invalid capture delay"
+      sleep "$capture_delay"
+      capture "$SOURCE" | head -c "$((CAPTURE_MAX_BYTES + 1))" > "$PNG"; rc=${PIPESTATUS[0]}
+      [[ $rc -eq 2 ]] && exit 0                     # cancelled the region select
+      [[ "$(stat -c%s "$PNG" 2>/dev/null || printf 0)" -le "$CAPTURE_MAX_BYTES" ]] ||
+        die "screen capture is larger than the 50 MiB safety limit"
+      [[ $rc -ne 0 || ! -s "$PNG" ]] && die "screen capture failed"
+      ocr_rc=0; TEXT="$(run_ocr_bounded "$OCR_BIN" "$PNG")" || ocr_rc=$?
+      record_ocr_outcome "$OCR_ENGINE" "$ocr_rc" "$TEXT" "$ocr_fingerprint"
+      [[ $ocr_rc -ne 0 ]] && exit $ocr_rc
+      OCRMODE=1
+      if [[ -z "${TEXT//[[:space:]]/}" ]]; then
+        notify noRegionText
+        exit 0
+      fi
+      ;;
+  esac
+fi
+
+[[ -n "${TEXT//[[:space:]]/}" ]] || {
+  [[ "$SOURCE" == selection ]] && notify noSelection
+  exit 0
+}
+
+input_bytes="$(LC_ALL=C printf '%s' "$TEXT" | wc -c)"
+input_bytes="${input_bytes//[[:space:]]/}"
+[[ "$input_bytes" -le "$INPUT_MAX_BYTES" ]] ||
+  die "input is larger than the 1 MiB safety limit"
+
+# --- resolve provider -----------------------------------------------------
+PROVIDER="${PROVIDER:-teratts}"
+PROV_BIN="$(provider_path "$PROVIDER")" || die "no such provider: $PROVIDER (try --list)"
+
+if [[ $RAWMODE -eq 0 && "$(meta_of "$PROV_BIN" preprocess)" == "raw" ]]; then
+  RAWMODE=1
+fi
+
+# --- sanitize -------------------------------------------------------------
+if [[ $RAWMODE -eq 0 ]]; then
+  MAXCHARS="${MAXCHARS:-$(cfg .maxChars 0)}"
+  SAN_ARGS=(--max-chars "$MAXCHARS" --config "$CONFIG")
+  [[ $OCRMODE -eq 1 ]] && SAN_ARGS+=(--ocr)
+  sanitize_rc=0
+  SPOKEN="$(printf '%s' "$TEXT" | python3 "$SANITIZER" "${SAN_ARGS[@]}")" || sanitize_rc=$?
+  if [[ $sanitize_rc -eq 1 ]]; then
+    notify noSpeech
+    exit 0
+  elif [[ $sanitize_rc -ne 0 ]]; then
+    die "text preparation failed (exit $sanitize_rc)"
+  fi
+else
+  SPOKEN="$TEXT"
+fi
+
+export TTS_VOICE="$VOICE"
+export TTS_SOURCE="$SOURCE"
+export TTS_PLUGIN_DIR="$PLUGIN_DIR"
+export TTS_CONFIG="$CONFIG"
+export TTS_DATA_DIR="$DATA_DIR"
+export TTS_METRICS_FILE="$CLOUD_DIR/$PROVIDER.json"
+export TTS_INPUT_CHARS="${#SPOKEN}"
+TTS_INPUT_BYTES="$(LC_ALL=C printf '%s' "$SPOKEN" | wc -c)"
+TTS_INPUT_BYTES="${TTS_INPUT_BYTES//[[:space:]]/}"
+export TTS_INPUT_BYTES
+
+provider_max="$(meta_of "$PROV_BIN" maxchars)"
+if [[ "$provider_max" =~ ^[0-9]+$ ]] &&
+    awk -v value="${#SPOKEN}" -v maximum="$provider_max" \
+      'BEGIN { exit !(value > maximum) }'; then
+  die "$PROVIDER accepts at most $provider_max characters per request; shorten the selection or set a length limit"
+fi
+provider_max_bytes="$(meta_of "$PROV_BIN" maxbytes)"
+if [[ "$provider_max_bytes" =~ ^[0-9]+$ ]] &&
+    awk -v value="$TTS_INPUT_BYTES" -v maximum="$provider_max_bytes" \
+      'BEGIN { exit !(value > maximum) }'; then
+  die "$PROVIDER accepts at most $provider_max_bytes UTF-8 bytes per request; shorten the selection or set a length limit"
+fi
+
+if [[ -z "$TTS_VOICE" ]]; then
+  TTS_VOICE="$(voice_for_provider "$PROVIDER")"
+  export TTS_VOICE
+fi
+if [[ ( "$PROVIDER" == elevenlabs || "$PROVIDER" == google ) && -z "$TTS_VOICE" ]]; then
+  die "$PROVIDER has no selected voice; run --refresh-voices $PROVIDER first"
+fi
+[[ -z "$TTS_VOICE" || "$TTS_VOICE" =~ ^[A-Za-z0-9._+-]+$ ]] ||
+  die "invalid configured voice name"
+
+# A single preference follows the user across providers, whose supported
+# ranges differ. Clamp a persisted value on use so switching providers cannot
+# produce a remote 400 or an extreme local speed. An explicit CLI override is
+# a request for this provider specifically, so reject it instead of silently
+# changing what the caller asked for.
+requested_rate="${RATE:-$(cfg .rate 1.0)}"
+provider_rate_min="$(meta_of "$PROV_BIN" ratemin)"
+provider_rate_max="$(meta_of "$PROV_BIN" ratemax)"
+TTS_RATE="$requested_rate"
+if [[ "$provider_rate_min" =~ ^[0-9]+([.][0-9]+)?$ &&
+      "$provider_rate_max" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  if [[ -n "$RATE" ]] && ! awk -v value="$requested_rate" -v minimum="$provider_rate_min" \
+      -v maximum="$provider_rate_max" 'BEGIN { exit !(value >= minimum && value <= maximum) }'; then
+    die "$PROVIDER supports rates from $provider_rate_min to $provider_rate_max"
+  fi
+  TTS_RATE="$(awk -v value="$requested_rate" -v minimum="$provider_rate_min" \
+    -v maximum="$provider_rate_max" 'BEGIN {
+      if (value < minimum) value=minimum
+      if (value > maximum) value=maximum
+      printf "%.4g", value
+    }')"
+fi
+export TTS_RATE
+provider_health_fingerprint="$(health_fingerprint "$PROVIDER" "$PROV_BIN" || true)"
+
+# --- speak ----------------------------------------------------------------
+exec {speech_lock_fd}>>"$SPEECH_LOCK"
+flock "$speech_lock_fd"
+# Handoff from preparation to playback is atomic under the same lock used by
+# Stop. Retain preparation ownership until playback ownership is published so
+# unlocked status readers and quick-action do not observe a false idle gap.
+current_prep="$(small_runtime_value "$PREP_FILE" 256 || true)"
+stop_owned_group "$PID_FILE"   # preserve this preparation's job and pause request
+legacy_status=speaking
+[[ "$JOB_KIND" == export ]] && legacy_status=preparing
+if ! atomic_state_write "$ACTIVE_PROVIDER_FILE" "$PROVIDER" || ! set_status "$legacy_status"; then
+  rm -f "$ACTIVE_PROVIDER_FILE"
+  flock -u "$speech_lock_fd"
+  exec {speech_lock_fd}>&-
+  die "could not write speech state"
+fi
+# The session leader publishes its own PID/start identity before exec. Asking
+# `ps` immediately after a background launch races with setsid: it can observe
+# the inherited preparation group and register a group the provider is about
+# to leave, making Stop miss the actual audio process. The private handshake
+# removes that race, while the waiting setsid parent preserves the provider's
+# eventual exit status.
+launch_state="$(mktemp "$STATE_DIR/.speech-launch.XXXXXX")" || {
+  rm -f "$ACTIVE_PROVIDER_FILE"; set_status idle
+  flock -u "$speech_lock_fd"; exec {speech_lock_fd}>&-
+  die "could not prepare speech process registration"
+}
+JOB_TEMP_FILES+=("$launch_state")
+# $0 is deliberately single-quoted: it must expand in the inner shell, where
+# it becomes $PROV_BIN, not here.
+# shellcheck disable=SC2016
+setsid --fork --wait env TTS_LAUNCH_STATE="$launch_state" bash -c '
+  stat_line=""
+  IFS= read -r stat_line < "/proc/$$/stat" || exit 125
+  rest="${stat_line##*) }"
+  read -r -a fields <<< "$rest"
+  identity="${fields[19]:-}"
+  group="${fields[2]:-}"
+  [[ "$identity" =~ ^[0-9]+$ && "$group" == "$$" ]] || exit 125
+  printf "%s %s\n" "$$" "$identity" > "$TTS_LAUNCH_STATE" || exit 125
+  unset TTS_LAUNCH_STATE
+  exec "$0"
+' "$PROV_BIN" <<< "$SPOKEN" &
+child=$!
+speech_pgid="" speech_identity=""
+for _ in {1..200}; do
+  IFS=' ' read -r speech_pgid speech_identity < "$launch_state" || true
+  if [[ "$speech_pgid" =~ ^[0-9]+$ && "$speech_pgid" -gt 1 &&
+        "$speech_identity" =~ ^[0-9]+$ ]]; then
+    break
+  fi
+  speech_pgid="" speech_identity=""
+  kill -0 "$child" 2>/dev/null || break
+  sleep 0.005
+done
+rm -f "$launch_state"
+speech_owner=""
+if [[ -z "$speech_pgid" || -z "$speech_identity" ]]; then
+  kill -TERM "$child" 2>/dev/null || true
+  rm -f "$ACTIVE_PROVIDER_FILE"
+  set_status idle
+  flock -u "$speech_lock_fd"
+  exec {speech_lock_fd}>&-
+  wait "$child" 2>/dev/null || true
+  die "could not identify speech process"
+fi
+speech_owner="$speech_pgid $speech_identity"
+if ! atomic_state_write "$PID_FILE" "$speech_owner"; then
+  if [[ "$(process_identity "$speech_pgid" || true)" == "$speech_identity" &&
+        "$(process_group "$speech_pgid" || true)" == "$speech_pgid" ]]; then
+    kill -KILL -- "-$speech_pgid" 2>/dev/null || true
+  fi
+  kill -TERM "$child" 2>/dev/null || true
+  rm -f "$ACTIVE_PROVIDER_FILE"
+  set_status idle
+  flock -u "$speech_lock_fd"
+  exec {speech_lock_fd}>&-
+  wait "$child" 2>/dev/null || true
+  die "could not register speech process"
+fi
+PLAYBACK_OWNER="$speech_owner"
+if [[ -n "$PREP_OWNER" && "$current_prep" == "$PREP_OWNER" ]]; then
+  rm -f "$PREP_FILE"
+  PREP_OWNER=""
+fi
+flock -u "$speech_lock_fd"
+exec {speech_lock_fd}>&-
+
+wait "$child"
+rc=$?
+
+# Whether this run was cancelled is a question about ownership, not about the
+# exit status. A provider that execs a player does not necessarily die by the
+# signal we sent it: mpv catches SIGTERM and exits 4 of its own accord, so
+# stopping cloud speech looked exactly like a backend that could not speak.
+# Ownership answers it for every provider without enumerating anyone's codes.
+speech_cancelled=0
+exec {speech_lock_fd}>>"$SPEECH_LOCK"
+flock "$speech_lock_fd"
+current_owner="$(small_runtime_value "$PID_FILE" 256 || true)"
+if [[ -n "$speech_owner" && "$current_owner" != "$speech_owner" ]]; then
+  # Someone stopped us or replaced us; the state is already theirs to own.
+  speech_cancelled=1
+else
+  rm -f "$PID_FILE" "$ACTIVE_PROVIDER_FILE"
+  set_status idle
+fi
+PLAYBACK_OWNER=""
+flock -u "$speech_lock_fd"
+exec {speech_lock_fd}>&-
+
+if [[ $speech_cancelled -eq 1 ]]; then
+  exit 0
+fi
+
+# Real use is the best evidence there is.
+if [[ $rc -eq 0 && "$JOB_KIND" != preview ]]; then
+  [[ -z "$provider_health_fingerprint" ]] ||
+    health_set "$PROVIDER" ok "" "$provider_health_fingerprint"
+elif [[ "$JOB_KIND" == speech && $rc -eq 77 ]]; then
+  [[ -z "$provider_health_fingerprint" ]] ||
+    health_set "$PROVIDER" failed "exit $rc" "$provider_health_fingerprint"
+  notify unauthorized
+fi
+case "$rc" in
+  69) notify billing ;;
+  74) notify network ;;
+  75) notify rateLimit ;;
+esac
+# 143/137 = we cancelled it on purpose, not a failure
+[[ $rc -eq 143 || $rc -eq 137 ]] && exit 0
+exit $rc
