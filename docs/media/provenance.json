@@ -97,6 +97,40 @@
       "minSsim": 0.9963,
       "meanSsim": 0.9969,
       "framesBelow098": 0
+    },
+    "navigation.mp4": {
+      "sha256": "3eb9a42439b37ffddc071ab444f13a38dc1b2df81926fba6703df9d586504d90",
+      "frames": 33,
+      "seconds": 11,
+      "fps": 3,
+      "pixels": [
+        380,
+        540
+      ],
+      "audio": false,
+      "source": "Cut from the actual-panel demo",
+      "fixturePlayback": false,
+      "inspected": true,
+      "minSsim": 0.9961,
+      "meanSsim": 0.9967,
+      "framesBelow098": 0
+    },
+    "playback-states.mp4": {
+      "sha256": "23d52bd79a70ea37e802bc13e154cd327280f683ac429b8c0e3b5cc94cae3399",
+      "frames": 21,
+      "seconds": 7,
+      "fps": 3,
+      "pixels": [
+        380,
+        540
+      ],
+      "audio": false,
+      "source": "Cut from the actual-panel demo",
+      "fixturePlayback": true,
+      "inspected": true,
+      "minSsim": 0.9969,
+      "meanSsim": 0.997,
+      "framesBelow098": 0
     }
   },
   "host": {

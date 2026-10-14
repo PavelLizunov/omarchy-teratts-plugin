@@ -11,9 +11,9 @@ interface. This is a community plugin, not an official Omarchy component.
 
 ![Native Read panel with selection, clipboard, capture, voice and speed controls](docs/media/read-dark.png)
 
-Screenshots and the [short demo](docs/media/demo.mp4) use the actual QML panel
-with inert example data. The demo is silent; it does not demonstrate a live
-server, screen capture or audio quality. [More previews and provenance](docs/media/README.md).
+Screenshots and the [short demos](docs/media/README.md) use the actual QML panel
+with inert example data. The [full 18-second demo](docs/media/demo.mp4) is silent;
+it does not demonstrate a live server, screen capture or audio quality.
 
 ## Install
 

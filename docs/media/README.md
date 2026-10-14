@@ -11,14 +11,22 @@ production desktop captures and contain no real endpoint, account or recording.
 ![Saved files, dark palette](files-dark.png)
 ![Server settings, dark palette](settings-dark.png)
 
-[Download or open the 18-second silent demo](demo.mp4).
+[11-second navigation demo](navigation.mp4): Read, Files, file creation, Settings
+and the user-owned server fields.
+
+[7-second playback-state demo](playback-states.mp4): Speaking, Paused and Ready,
+using controlled fixture inputs.
+
+[Full 18-second silent demo](demo.mp4) combines both parts.
 
 The demo uses actual QtTest pointer navigation through Read, Files, file creation,
 Settings and Server. It includes labeled fixture playback and pause states; their
 bands are controlled fixture inputs, not measurements of real synthesized speech.
 The production player still measures its own audio. The video has 54 actual
 panel frames, encoded at 3 frames per second as H.264/yuv420p, 380x540, no audio.
-PNG frames and decoded video contact frames were inspected. This is a condensed
+The shorter cuts preserve the same 33 navigation frames and 21 playback-state
+frames. Both have no audio; every encoded frame was compared with its original
+and decoded contact frames were inspected. This is a condensed
 UI demonstration, not a recording of desktop interaction or a timing benchmark.
 
 Reproduction uses tests/capture_ui.py and tests/capture_demo.py with the installed
