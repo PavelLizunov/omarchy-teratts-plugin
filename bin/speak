@@ -618,7 +618,7 @@ emit_info() {
       credential_env="$(key_env_of "$n" "$b")"
       health="$(health_of "$n" "$b" "$credential_source" "$credential_identity")"
       status="$(provider_status "$b" "$health" "$credential_source")"
-      jq -nc --arg name "$n" \
+      jq -c --arg name "$n" \
              --arg title "$(meta_of "$b" title)" \
              --arg kind "$(meta_of "$b" kind)" \
              --arg desc "$(meta_of "$b" desc)" \
@@ -636,9 +636,8 @@ emit_info() {
              --arg refreshUsage "$(meta_of "$b" refreshusage)" \
              --arg keySource "$credential_source" \
              --arg keyEnv "$credential_env" \
-             --argjson config "$config" \
              --argjson usage "$(cloud_metrics_of "$n")" \
-             '{name:$name, title:(if $title=="" then $name else $title end), health:$health, kind:(if $kind=="" then "local" else $kind end),
+             '. as $config | {name:$name, title:(if $title=="" then $name else $title end), health:$health, kind:(if $kind=="" then "local" else $kind end),
                desc:$desc, status:$status, install:$install, vendor:$vendor,
                keySource:$keySource, keyEnv:(if $keyEnv=="" then null else $keyEnv end),
                deprecated:($deprecated=="true"),
@@ -652,7 +651,7 @@ emit_info() {
                maxBytes:(if $maxBytes=="" then null else (try ($maxBytes|tonumber) catch null) end),
                rateMin:(if $rateMin=="" then null else (try ($rateMin|tonumber) catch null) end),
                rateMax:(if $rateMax=="" then null else (try ($rateMax|tonumber) catch null) end),
-               voices:(if $voices=="" then "fixed" else $voices end)}'
+               voices:(if $voices=="" then "fixed" else $voices end)}' <<< "$config"
     done | jq -sc 'sort_by(.kind == "cloud", .status != "ready", .name)'
   )"
   local engines="[]"
@@ -691,16 +690,16 @@ emit_info() {
   # The voice list goes through a descriptor, not an argument: a cloud
   # provider can list two thousand voices, which is past the single-argument
   # limit and would make --info fail only for the accounts with the most.
-  jq -nc \
+  # Configuration includes private sample text; read it on stdin, never argv.
+  jq -c \
     --argjson providers "$provs" \
     --slurpfile voicesFile <(printf '%s\n' "$vs") \
-    --argjson config "$config" \
     --arg voice "$voice" \
     --arg voicePath "$voice_path" \
     --argjson ocrLanguages "$(ocr_languages "$(jq -r '.ocr.engine // "tesseract"' <<< "$config")")" \
     --argjson ocrEngines "$engines" \
     --argjson speaking "$speaking" \
-    '{provider:"teratts", endpoint:($config.teratts.endpoint // ""), voice:$voice, voicePath:$voicePath,
+    '. as $config | {provider:"teratts", endpoint:($config.teratts.endpoint // ""), voice:$voice, voicePath:$voicePath,
       rate:($config.rate // 1.0), maxChars:($config.maxChars // 0),
       speaking:$speaking, providers:$providers, voices:$voicesFile[0],
       ocr:{engine:($config.ocr.engine // "tesseract"),
@@ -719,7 +718,7 @@ emit_info() {
       ui:{lastTab:($config.ui.lastTab // 0),
         exportFormat:($config.ui.exportFormat // "mp3"),
         sampleText:($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now."),
-        sampleIsDefault:(($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now.") == "Highlight any text and press the key. This is how it sounds right now.")}}'
+        sampleIsDefault:(($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now.") == "Highlight any text and press the key. This is how it sounds right now.")}}' <<< "$config"
 }
 
 set_config() { # validated path value; forget proof tied to the old setting

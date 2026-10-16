@@ -38,6 +38,28 @@ paths and checks manifest/docs/runtime requirements. Pattern checks are bounded
 controls, not universal secret or security certification. The synthetic base64
 sanitizer fixture is an explicit known test, not a stored bearer token.
 
+## Private sample/config transport
+
+Marketplace issue [#11520](https://github.com/omacom/omarchy-plugin-marketplace/issues/11520)
+identified that saving sample text used `jq --arg` and loading the panel used
+`jq --argjson config`. Those process arguments could disclose private text to
+other local users on systems with cross-user process-argument visibility, even
+though the panel sent the original value through stdin.
+
+String config writes now use jq's raw stdin input, and both info-building
+expressions receive the config through stdin. Existing validation, atomic writes,
+mode 0600 and the panel JSON contract are unchanged. The legacy CLI forms that
+explicitly accept text as command arguments remain public argument interfaces;
+use `--set-stdin-json` for private sample updates.
+
+`tests/test_config_privacy.py` invokes the real save/reload CLI in isolated XDG
+stores. A jq wrapper records its actual `/proc/self/cmdline`, then executes real
+jq. It checks synthetic sample and unrelated private-extension markers, Unicode,
+quotes, backslashes, embedded newlines, shell-like text, 4096 characters and an
+empty value. The test failed on the submitted source for save and reload before
+the repair, and passes after it. This proves the tested transport boundary, not
+universal process privacy, live installation or Marketplace acceptance.
+
 ## Current evidence and limits
 
 The underlying 0.3.16 panel/backend was checked with 162 Python tests, 28 actual
