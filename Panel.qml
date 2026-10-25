@@ -3,6 +3,8 @@ import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Host
+import "." as Local
 import qs.Ui
 
 Panel {
@@ -133,7 +135,7 @@ Panel {
     return glyphs[action === "pause" ? "pause" : action] || glyphs.keys
   }
 
-  I18n {
+  Local.I18n {
     id: i18n
     language: String(root.settings?.locale || "ru")
     onLocaleChanged: root.updateLocalizedSample()
@@ -973,14 +975,14 @@ Panel {
 
   component CopyLabel: Text {
     textFormat: Text.PlainText
-    color: Color.popups.text
+    color: Host.Color.popups.text
     font.family: root.ff
     font.pixelSize: Style.font.body
     wrapMode: Text.WordWrap
   }
   component CopyNote: CopyLabel {
     font.pixelSize: Style.font.bodySmall
-    color: Qt.darker(Color.popups.text, 1.15)
+    color: Qt.darker(Host.Color.popups.text, 1.15)
   }
   component PanelHeading: Item {
     id: heading
@@ -1008,14 +1010,14 @@ Panel {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       text: heading.text
-      foreground: Color.popups.text
+      foreground: Host.Color.popups.text
       fontFamily: root.ff
       fontSize: heading.fontSize
       wrapMode: Text.WordWrap
     }
   }
   component PanelAction: Button {
-    foreground: Color.popups.text
+    foreground: Host.Color.popups.text
     fontFamily: root.ff
     focusable: true
     bordered: true
@@ -1060,7 +1062,7 @@ Panel {
           TeraIcon {
             id: panelIcon
             iconSize: Style.font.display
-            color: Color.popups.text
+            color: Host.Color.popups.text
             playing: root.speaking
             levels: root.playback.bands || [0, 0, 0, 0]
             busy: ["preparing", "buffering", "exporting"].indexOf(root.playback.status) >= 0
@@ -1107,7 +1109,7 @@ Panel {
             }
           }
         }
-        PanelSeparator { width: parent.width; foreground: Color.popups.text }
+        PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
       }
 
       Column {
@@ -1115,7 +1117,7 @@ Panel {
         anchors.bottom: parent.bottom
         width: parent.width
         spacing: Style.space(6)
-        PanelSeparator { width: parent.width; foreground: Color.popups.text }
+        PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
         Row {
           id: playbackControls
           width: parent.width
@@ -1184,7 +1186,7 @@ Panel {
           contentItem: Rectangle {
             implicitWidth: Style.space(3)
             radius: width / 2
-            color: Color.popups.text
+            color: Host.Color.popups.text
             opacity: scrollBar.active || scrollBar.hovered ? .65 : .3
           }
         }
@@ -1219,9 +1221,9 @@ Panel {
               id: audioSeekSlider
               width: parent.width
               bar: root.bar
-              trackColor: Style.selectedFillFor(Color.popups.text, Color.accent)
-              fillColor: Color.popups.text
-              knobColor: Color.popups.text
+              trackColor: Style.selectedFillFor(Host.Color.popups.text, Host.Color.accent)
+              fillColor: Host.Color.popups.text
+              knobColor: Host.Color.popups.text
               activeFocusOnTab: true
               enabled: root.previewDuration > 0 && ["playing", "paused"].indexOf(root.playback.status) >= 0 && !seekProc.running
               minimum: 0
@@ -1243,14 +1245,14 @@ Panel {
                 color: "transparent"
                 radius: Style.cornerRadius
                 border.width: Style.normalBorderWidth
-                border.color: Color.popups.text
+                border.color: Host.Color.popups.text
               }
               Accessible.name: i18n.text("audio.player")
             }
             CopyNote {
               text: i18n.text("audio.progress", {elapsed:root.audioTime(audioSeekSlider.dragging ? audioSeekSlider.liveValue : root.previewPosition), total:root.audioTime(root.previewDuration)})
             }
-            PanelSeparator { width: parent.width; foreground: Color.popups.text }
+            PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
           }
 
           Column {
@@ -1272,7 +1274,7 @@ Panel {
                   height: Style.space(42)
                   text: i18n.text("read.selection")
                   iconText: root.glyphs.selection
-                  background: Style.selectedFillFor(Color.popups.text, Color.accent)
+                  background: Style.selectedFillFor(Host.Color.popups.text, Host.Color.accent)
                   tooltipText: root.shortcutChord(root.bindingActions[0])
                   enabled: root.infoLoaded && !root.busy && !speechProc.running
                   onClicked: root.readTextSource("selection")
@@ -1326,7 +1328,7 @@ Panel {
                 onClicked: root.selectSettings("screen")
               }
             }
-            PanelSeparator { width: parent.width; foreground: Color.popups.text }
+            PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
             Column {
               width: parent.width
               spacing: Style.spacing.controlGap
@@ -1350,7 +1352,7 @@ Panel {
                 id: voiceDropdown
                 width: parent.width
                 showLabel: false
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 fontFamily: root.ff
                 enabled: root.infoLoaded && !root.voiceBusy && (root.info.voices || []).length > 0
                 options: root.voiceOptions()
@@ -1390,9 +1392,9 @@ Panel {
                   width: parent.width - slowerButton.width - fasterButton.width - parent.spacing * 2
                   height: slowerButton.height
                   bar: root.bar
-                  trackColor: Style.selectedFillFor(Color.popups.text, Color.accent)
-                  fillColor: Color.popups.text
-                  knobColor: Color.popups.text
+                  trackColor: Style.selectedFillFor(Host.Color.popups.text, Host.Color.accent)
+                  fillColor: Host.Color.popups.text
+                  knobColor: Host.Color.popups.text
                   activeFocusOnTab: true
                   enabled: root.infoLoaded
                   minimum: .25
@@ -1417,7 +1419,7 @@ Panel {
                     color: "transparent"
                     radius: Style.cornerRadius
                     border.width: Style.normalBorderWidth
-                    border.color: Color.popups.text
+                    border.color: Host.Color.popups.text
                   }
                   Accessible.name: i18n.text("voice.speed")
                 }
@@ -1464,7 +1466,7 @@ Panel {
                 id: exportSourceDropdown
                 width: parent.width
                 showLabel: false
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 fontFamily: root.ff
                 value: root.exportSource
                 options: ["selection", "clipboard", "snip", "window", "screen", "sample"].map(function(source) { return {value:source, label:i18n.text("audio.source." + source)} })
@@ -1477,7 +1479,7 @@ Panel {
                   id: exportFormatDropdown
                   width: (parent.width - parent.spacing) * .45
                   showLabel: false
-                  foreground: Color.popups.text
+                  foreground: Host.Color.popups.text
                   fontFamily: root.ff
                   value: root.exportFormat
                   options: ["mp3", "ogg", "wav"].map(function(format) { return {value:format, label:format === "ogg" ? "OGG / Opus" : format.toUpperCase()} })
@@ -1494,7 +1496,7 @@ Panel {
                 }
               }
               CopyNote { width: parent.width; text: i18n.text("audio.exportHint") }
-              PanelSeparator { width: parent.width; foreground: Color.popups.text }
+              PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
             }
             CopyNote { width: parent.width; visible: root.audioMessage !== ""; text: root.audioMessage }
             CopyLabel { width: parent.width; visible: root.audioItems.length === 0; text: i18n.text(audioListProc.running ? "audio.loading" : "audio.empty") }
@@ -1574,7 +1576,7 @@ Panel {
                     }
                   }
                 }
-                PanelSeparator { width: parent.width; foreground: Color.popups.text }
+                PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
               }
             }
             PanelAction { width: parent.width; text: i18n.text("audio.openFolder"); iconText: root.glyphs.folder; bordered: false; enabled: !audioActionProc.running; onClicked: root.audioAction("--audio-open-folder", "") }
@@ -1619,7 +1621,7 @@ Panel {
                 width: parent.width
                 text: root.sampleText
                 maximumLength: 4096
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 selectByMouse: true
                 onActiveFocusChanged: if (activeFocus) Qt.callLater(function() { root.reveal(sampleField) })
                 onTextChanged: { root.sampleText = text; if (activeFocus) root.sampleDirty = true }
@@ -1645,7 +1647,7 @@ Panel {
                 id: ocrEngineDropdown
                 width: parent.width
                 showLabel: false
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 fontFamily: root.ff
                 enabled: root.infoLoaded && root.ocrEngineOptions().length > 0
                 options: root.ocrEngineOptions()
@@ -1669,7 +1671,7 @@ Panel {
                   id: ocrLanguageDropdown
                   width: parent.width
                   showLabel: false
-                  foreground: Color.popups.text
+                  foreground: Host.Color.popups.text
                   fontFamily: root.ff
                   enabled: root.infoLoaded && root.ocrLanguageOptions().length > 0
                   options: root.ocrLanguageOptions()
@@ -1697,7 +1699,7 @@ Panel {
               TextField {
                 id: endpointField
                 width: parent.width
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 text: root.info.endpoint || ""
                 placeholderText: "https://tts.example.com"
                 selectByMouse: true
@@ -1721,7 +1723,7 @@ Panel {
                   width: parent.width
                   password: true
                   maximumLength: 4096
-                  foreground: Color.popups.text
+                  foreground: Host.Color.popups.text
                   placeholderText: i18n.text("server.tokenPlaceholder")
                   selectByMouse: true
                   onVisibleChanged: if (!visible) text = ""
@@ -1737,12 +1739,12 @@ Panel {
                 }
               }
               CopyNote { width: parent.width; text: i18n.text(root.keySaved ? "server.tokenSaved" : "server.tokenHint") }
-              PanelSeparator { width: parent.width; foreground: Color.popups.text }
+              PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
               PanelHeading { text: i18n.text("server.ocrAddress"); iconText: root.glyphs.server }
               TextField {
                 id: ocrEndpointField
                 width: parent.width
-                foreground: Color.popups.text
+                foreground: Host.Color.popups.text
                 text: root.info.ocr?.remoteEndpoint || ""
                 placeholderText: i18n.text("server.ocrAddressPlaceholder")
                 selectByMouse: true
@@ -1815,14 +1817,14 @@ Panel {
                 visible: root.bindingAction !== "" && root.bindingInfo.installed
                 enabled: visible
                 spacing: Style.spacing.controlGap
-                PanelSeparator { width: parent.width; foreground: Color.popups.text }
+                PanelSeparator { width: parent.width; foreground: Host.Color.popups.text }
                 PanelHeading { text: i18n.text("keys.edit", {action:i18n.text("shortcut." + root.bindingAction)}); iconText: root.shortcutIcon(root.bindingAction) }
                 TextField {
                   id: chordField
                   width: parent.width
                   text: ""
                   maximumLength: 80
-                  foreground: Color.popups.text
+                  foreground: Host.Color.popups.text
                   selectByMouse: true
                   placeholderText: i18n.text("keys.placeholder")
                   onActiveFocusChanged: if (activeFocus) Qt.callLater(function() { root.reveal(chordField) })

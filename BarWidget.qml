@@ -1,13 +1,15 @@
 import QtQuick 6.11
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Host
+import "." as Local
 import qs.Ui
 
 BarWidget {
   id: root
   moduleName: "io.github.pavellizunov.teratts"
 
-  I18n {
+  Local.I18n {
     id: i18n
     language: String(root.settings?.locale || "ru")
   }
@@ -149,7 +151,7 @@ BarWidget {
 
     TeraIcon {
       anchors.centerIn: parent
-      color: !stateStream.connected ? Color.urgent : button.active && button.useActiveColor ? button.activeColor : button.foreground
+      color: !stateStream.connected ? Host.Color.urgent : button.active && button.useActiveColor ? button.activeColor : button.foreground
       iconSize: Style.bar.iconCanvas
       playing: root.speaking
       levels: root.liveState.bands || [0, 0, 0, 0]
